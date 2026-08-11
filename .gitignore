@@ -4,3 +4,4 @@ __pycache__/
 *.db
 web_scraping/
 .venv/
+.claude/
