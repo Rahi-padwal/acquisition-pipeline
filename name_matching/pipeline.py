@@ -62,10 +62,16 @@ def _create_tables(conn: sqlite3.Connection) -> None:
             companyName TEXT,
             isAcquired INTEGER,
             acquirerName TEXT,
-            rawName TEXT
+            rawName TEXT,
+            status TEXT
         )
         """
     )
+
+    existing_columns = {row[1] for row in conn.execute("PRAGMA table_info(company_acquisitions)")}
+    if "status" not in existing_columns:
+        conn.execute("ALTER TABLE company_acquisitions ADD COLUMN status TEXT")
+
     conn.commit()
 
 
@@ -115,7 +121,9 @@ def fetch_random_sample(es: Elasticsearch, size: int) -> list[dict]:
     return hits[:size]
 
 
-def fetch_dwh_ids(conn: sqlite3.Connection, es: Elasticsearch) -> list[str]:
+def fetch_dwh_ids(conn: sqlite3.Connection, es: Elasticsearch) -> list[tuple[str, str | None]]:
+    """Returns (dwhId, companyName) pairs - the name travels with the id so
+    Step 2 still has it even if its own lookup for that dwhId fails."""
     logger.info("Fetching %d random companies from '%s'...", SAMPLE_SIZE, ES_INDEX)
     hits = fetch_random_sample(es, SAMPLE_SIZE)
 
@@ -135,20 +143,24 @@ def fetch_dwh_ids(conn: sqlite3.Connection, es: Elasticsearch) -> list[str]:
     if skipped:
         logger.warning("Skipped %d hits with no dwhId.", skipped)
     logger.info("Fetched %d companies.", len(rows))
-    return [dwh_id for dwh_id, _ in rows]
+    return rows
 
 
 # --- Step 2: run acquisition detection over those dwhIds -------------------
 
 
-def process_company(dwh_id: str, data_source: ElasticCompanyDataSource) -> dict[str, Any]:
-    """Never raises - failures come back as status="error" instead of dropping."""
+def process_company(dwh_id: str, company_name: str | None, data_source: ElasticCompanyDataSource) -> dict[str, Any]:
+    """Never raises - failures come back as status="error" instead of dropping.
+    `company_name` is the name already fetched in Step 1; it's used whenever
+    this dwhId's own lookup here doesn't come back with a real name (not_found
+    returns the query string itself in place of a name, error returns none)."""
     try:
         result = run_dwh_id_check(dwh_id, data_source)
         evidence = result["evidence"]
+        resolved_name = result["company_name"] if result["status"] == "checked" else company_name
         return {
             "dwhId": dwh_id,
-            "companyName": result["company_name"],
+            "companyName": resolved_name,
             "isAcquired": int(result["is_acquired"]),
             "acquirerName": result["likely_acquirer"],
             "rawName": evidence[0]["raw_name"] if evidence else None,
@@ -158,7 +170,7 @@ def process_company(dwh_id: str, data_source: ElasticCompanyDataSource) -> dict[
         logger.exception("dwhId %s: failed to process", dwh_id)
         return {
             "dwhId": dwh_id,
-            "companyName": None,
+            "companyName": company_name,
             "isAcquired": None,
             "acquirerName": None,
             "rawName": None,
@@ -166,26 +178,29 @@ def process_company(dwh_id: str, data_source: ElasticCompanyDataSource) -> dict[
         }
 
 
-def run_acquisition_checks(conn: sqlite3.Connection, dwh_ids: list[str]) -> None:
+def run_acquisition_checks(conn: sqlite3.Connection, companies: list[tuple[str, str | None]]) -> None:
     data_source = ElasticCompanyDataSource(host=ES_HOST, index=ES_INDEX, api_key=ES_API_KEY)
 
-    logger.info("Checking %d companies for acquisitions with %d workers...", len(dwh_ids), MAX_WORKERS)
+    logger.info("Checking %d companies for acquisitions with %d workers...", len(companies), MAX_WORKERS)
 
     start = time.time()
     results: list[dict[str, Any]] = []
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {executor.submit(process_company, dwh_id, data_source): dwh_id for dwh_id in dwh_ids}
+        futures = {
+            executor.submit(process_company, dwh_id, company_name, data_source): dwh_id
+            for dwh_id, company_name in companies
+        }
         for i, future in enumerate(as_completed(futures), start=1):
             results.append(future.result())
-            if i % PROGRESS_EVERY == 0 or i == len(dwh_ids):
-                logger.info("Processed %d/%d", i, len(dwh_ids))
+            if i % PROGRESS_EVERY == 0 or i == len(companies):
+                logger.info("Processed %d/%d", i, len(companies))
 
     # Only the main thread touches SQLite - writes happen after all workers finish.
     for row in results:
         conn.execute(
             "INSERT OR REPLACE INTO company_acquisitions "
-            "(dwhId, companyName, isAcquired, acquirerName, rawName) VALUES (?, ?, ?, ?, ?)",
-            (row["dwhId"], row["companyName"], row["isAcquired"], row["acquirerName"], row["rawName"]),
+            "(dwhId, companyName, isAcquired, acquirerName, rawName, status) VALUES (?, ?, ?, ?, ?, ?)",
+            (row["dwhId"], row["companyName"], row["isAcquired"], row["acquirerName"], row["rawName"], row["status"]),
         )
     conn.commit()
 
@@ -212,13 +227,13 @@ def main() -> None:
     conn = sqlite3.connect(DB_PATH)
     _create_tables(conn)
 
-    dwh_ids = fetch_dwh_ids(conn, es)
-    if not dwh_ids:
+    companies = fetch_dwh_ids(conn, es)
+    if not companies:
         logger.warning("No dwhIds fetched - nothing to check.")
         conn.close()
         return
 
-    run_acquisition_checks(conn, dwh_ids)
+    run_acquisition_checks(conn, companies)
     conn.close()
 
 

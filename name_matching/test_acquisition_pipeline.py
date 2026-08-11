@@ -26,8 +26,8 @@ logger = logging.getLogger(__name__)
 ES_HOST = os.environ.get("ES_HOST", "https://prodelastic.growthpal.com/")
 ES_API_KEY = os.environ.get("ES_API_KEY")
 INDEX = "sellers_0726"
-DB_PATH = "acquisitions.db"
-MAX_WORKERS = 5
+DB_PATH = "test_acquisitions.db"
+MAX_WORKERS = 10
 
 # Cluster intermittently 404s transiently - retry before giving up.
 _MAX_SEARCH_ATTEMPTS = 3
@@ -42,19 +42,7 @@ _SOURCE_FIELDS = [
     "linkedinProfileName",
 ]
 
-# Fill in with the 10 dwhIds to test.
-DWH_IDS: list[str] = [
-    "b0fcc1b613b2d892eae9834345a31fb8",
-    "f30bfdb5dd69c8f4a183b533fa2eb739",
-    "bd3d35d96ec7c78434cfaa078a7fba7d",
-    "382e49638c9f1363a26d21d664c0b704",
-    "3830294b80cd3c39ab0b49d41cc002de",
-    "42ef002ded27a7076ecbccd4b2398034",
-    "bd1d6ea7dae2ea4257edc7d2b4120805",
-    "8714fb200458bb5105caf39a045a7c19",
-    "f6b305db5ef425b94911d7cc136ef52e",
-    "39e2d3a104b5eb4a263d943f337478ae"
-]
+DWH_COUNT = 1000
 
 # Acquirer name: starts alnum, up to 50 more name-shaped chars, non-greedy.
 _ACQUIRER_CAPTURE = r"(?P<acquirer>[A-Za-z0-9][\w&.,' -]{1,50}?)"
@@ -64,23 +52,24 @@ _LEADING_DELIM = r"(?:[,\-–—(]\s*)*"
 
 _ACQUISITION_PATTERNS = [
     ("part_of", re.compile(_LEADING_DELIM + r"(?:now\s+)?part\s+of\s+" + _ACQUIRER_CAPTURE + _END, re.IGNORECASE)),
-    ("a_x_company", re.compile(_LEADING_DELIM + r"an?\s+" + _ACQUIRER_CAPTURE + r"\s+company" + _END, re.IGNORECASE)),
+    ("a_x_company", re.compile(_LEADING_DELIM + r"\ban?\s+" + _ACQUIRER_CAPTURE + r"\s+company" + _END, re.IGNORECASE)),
     (
         "subsidiary_of",
         re.compile(r"wholly[- ]owned\s+subsidiary\s+of\s+" + _ACQUIRER_CAPTURE + _END, re.IGNORECASE),
     ),
-    ("division_of", re.compile(r"a\s+division\s+of\s+" + _ACQUIRER_CAPTURE + _END, re.IGNORECASE)),
+    ("division_of", re.compile(r"\ba\s+division\s+of\s+" + _ACQUIRER_CAPTURE + _END, re.IGNORECASE)),
     ("operating_unit_of", re.compile(r"operating\s+unit\s+of\s+" + _ACQUIRER_CAPTURE + _END, re.IGNORECASE)),
 ]
 
 
-def _extract_acquirer_from_text(text: str | None) -> str | None:
+def _extract_acquirer_from_text(text: str | None) -> tuple[str, str] | None:
+    """Returns (acquirer, tag) for the first pattern that matches, or None."""
     if not text:
         return None
-    for _name, pattern in _ACQUISITION_PATTERNS:
+    for tag, pattern in _ACQUISITION_PATTERNS:
         match = pattern.search(text)
         if match:
-            return match.group("acquirer").strip().rstrip(").,")
+            return match.group("acquirer").strip().rstrip(").,"), tag
     return None
 
 
@@ -95,16 +84,13 @@ def _get_nested(source: dict[str, Any], dotted_path: str) -> Any:
     return value
 
 
-def _search_with_retry(dwh_id: str) -> dict[str, Any]:
+def _es_search_with_retry(**kwargs: Any) -> dict[str, Any]:
+    """Retries any `_es.search(...)` call - the cluster intermittently 404s
+    transiently (see module docstring / pipeline.py for the same pattern)."""
     last_error: Exception | None = None
     for attempt in range(1, _MAX_SEARCH_ATTEMPTS + 1):
         try:
-            return _es.search(
-                index=INDEX,
-                query={"term": {"dwhId": dwh_id}},
-                source=_SOURCE_FIELDS,
-                size=1,
-            )
+            return _es.search(index=INDEX, **kwargs)
         except Exception as exc:
             last_error = exc
             if attempt < _MAX_SEARCH_ATTEMPTS:
@@ -112,16 +98,38 @@ def _search_with_retry(dwh_id: str) -> dict[str, Any]:
     raise last_error  # type: ignore[misc]
 
 
+def _search_with_retry(dwh_id: str) -> dict[str, Any]:
+    return _es_search_with_retry(
+        query={"term": {"dwhId": dwh_id}},
+        source=_SOURCE_FIELDS,
+        size=1,
+    )
+
+
+def get_dwh_ids(size: int) -> list[str]:
+    resp = _es_search_with_retry(
+        query={"match_all": {}},
+        source=["dwhId"],
+        size=size,
+    )
+    return [
+        hit["_source"]["dwhId"]
+        for hit in resp["hits"]["hits"]
+        if hit["_source"].get("dwhId")
+    ]
+
+
 def process_company(dwh_id: str) -> dict[str, Any]:
     """Fetch `dwh_id` and detect acquisition: acquirerCompanyName field >
     regex over companyName/linkedinProfileName > isAcquired flag > none.
+    `tag` records which of those signals produced the result, for auditing.
     Never raises - failures return isAcquired=None instead of dropping."""
     try:
         resp = _search_with_retry(dwh_id)
         hits = resp["hits"]["hits"]
         if not hits:
             logger.error("dwhId %s: no document found", dwh_id)
-            return {"dwhId": dwh_id, "companyName": None, "isAcquired": None, "acquirerCompany": None}
+            return {"dwhId": dwh_id, "companyName": None, "isAcquired": None, "acquirerCompany": None, "tag": None}
 
         source = hits[0]["_source"]
         company_name = source.get("companyName")
@@ -133,18 +141,21 @@ def process_company(dwh_id: str) -> dict[str, Any]:
                 "companyName": company_name,
                 "isAcquired": 1,
                 "acquirerCompany": acquirer,
+                "tag": "acquirerCompanyName",
             }
 
         # Regex before the bare isAcquired flag, so a name match still fills
         # in the acquirer even when the flag alone would leave it None.
         for text in (company_name, source.get("linkedinProfileName")):
-            acquirer = _extract_acquirer_from_text(text)
-            if acquirer:
+            match = _extract_acquirer_from_text(text)
+            if match:
+                acquirer, tag = match
                 return {
                     "dwhId": dwh_id,
                     "companyName": company_name,
                     "isAcquired": 1,
                     "acquirerCompany": acquirer,
+                    "tag": tag,
                 }
 
         if source.get("isAcquired"):
@@ -153,13 +164,14 @@ def process_company(dwh_id: str) -> dict[str, Any]:
                 "companyName": company_name,
                 "isAcquired": 1,
                 "acquirerCompany": None,
+                "tag": "isAcquired_flag",
             }
 
-        return {"dwhId": dwh_id, "companyName": company_name, "isAcquired": 0, "acquirerCompany": None}
+        return {"dwhId": dwh_id, "companyName": company_name, "isAcquired": 0, "acquirerCompany": None, "tag": None}
 
     except Exception:
         logger.exception("dwhId %s: failed to process", dwh_id)
-        return {"dwhId": dwh_id, "companyName": None, "isAcquired": None, "acquirerCompany": None}
+        return {"dwhId": dwh_id, "companyName": None, "isAcquired": None, "acquirerCompany": None, "tag": None}
 
 
 def _create_table(conn: sqlite3.Connection) -> None:
@@ -169,22 +181,28 @@ def _create_table(conn: sqlite3.Connection) -> None:
             dwhId TEXT PRIMARY KEY,
             companyName TEXT,
             isAcquired INTEGER,
-            acquirerCompany TEXT
+            acquirerCompany TEXT,
+            tag TEXT
         )
         """
     )
+
+    existing_columns = {row[1] for row in conn.execute("PRAGMA table_info(company_acquisitions)")}
+    if "tag" not in existing_columns:
+        conn.execute("ALTER TABLE company_acquisitions ADD COLUMN tag TEXT")
+
     conn.commit()
 
 
 def _print_results(conn: sqlite3.Connection, dwh_ids: list[str]) -> None:
     placeholders = ",".join("?" * len(dwh_ids))
     rows = conn.execute(
-        f"SELECT dwhId, companyName, isAcquired, acquirerCompany FROM company_acquisitions "
+        f"SELECT dwhId, companyName, isAcquired, acquirerCompany, tag FROM company_acquisitions "
         f"WHERE dwhId IN ({placeholders})",
         dwh_ids,
     ).fetchall()
 
-    headers = ["dwhId", "companyName", "isAcquired", "acquirerCompany"]
+    headers = ["dwhId", "companyName", "isAcquired", "acquirerCompany", "tag"]
     widths = [
         max(len(headers[i]), *(len(str(row[i])) for row in rows)) if rows else len(headers[i])
         for i in range(len(headers))
@@ -200,8 +218,9 @@ def _print_results(conn: sqlite3.Connection, dwh_ids: list[str]) -> None:
 
 
 def main() -> None:
-    if not DWH_IDS:
-        logger.warning("DWH_IDS is empty - fill it in with the 10 dwhIds to test.")
+    dwh_ids = get_dwh_ids(DWH_COUNT)
+    if not dwh_ids:
+        logger.warning("No dwhIds returned from Elasticsearch.")
         return
 
     conn = sqlite3.connect(DB_PATH)
@@ -209,20 +228,20 @@ def main() -> None:
 
     results: list[dict[str, Any]] = []
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {executor.submit(process_company, dwh_id): dwh_id for dwh_id in DWH_IDS}
+        futures = {executor.submit(process_company, dwh_id): dwh_id for dwh_id in dwh_ids}
         for future in as_completed(futures):
             results.append(future.result())
 
     # Only the main thread touches SQLite - writes happen after all workers finish.
     for row in results:
         conn.execute(
-            "INSERT OR REPLACE INTO company_acquisitions (dwhId, companyName, isAcquired, acquirerCompany) "
-            "VALUES (?, ?, ?, ?)",
-            (row["dwhId"], row["companyName"], row["isAcquired"], row["acquirerCompany"]),
+            "INSERT OR REPLACE INTO company_acquisitions (dwhId, companyName, isAcquired, acquirerCompany, tag) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (row["dwhId"], row["companyName"], row["isAcquired"], row["acquirerCompany"], row["tag"]),
         )
     conn.commit()
 
-    _print_results(conn, DWH_IDS)
+    _print_results(conn, dwh_ids)
     conn.close()
 
 
