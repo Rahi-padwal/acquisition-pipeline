@@ -61,8 +61,8 @@ def _create_tables(conn: sqlite3.Connection) -> None:
             dwhId TEXT PRIMARY KEY,
             companyName TEXT,
             isAcquired INTEGER,
-            likelyAcquirer TEXT,
-            status TEXT
+            acquirerName TEXT,
+            rawName TEXT
         )
         """
     )
@@ -145,11 +145,13 @@ def process_company(dwh_id: str, data_source: ElasticCompanyDataSource) -> dict[
     """Never raises - failures come back as status="error" instead of dropping."""
     try:
         result = run_dwh_id_check(dwh_id, data_source)
+        evidence = result["evidence"]
         return {
             "dwhId": dwh_id,
             "companyName": result["company_name"],
             "isAcquired": int(result["is_acquired"]),
-            "likelyAcquirer": result["likely_acquirer"],
+            "acquirerName": result["likely_acquirer"],
+            "rawName": evidence[0]["raw_name"] if evidence else None,
             "status": result["status"],
         }
     except Exception:
@@ -158,7 +160,8 @@ def process_company(dwh_id: str, data_source: ElasticCompanyDataSource) -> dict[
             "dwhId": dwh_id,
             "companyName": None,
             "isAcquired": None,
-            "likelyAcquirer": None,
+            "acquirerName": None,
+            "rawName": None,
             "status": "error",
         }
 
@@ -181,8 +184,8 @@ def run_acquisition_checks(conn: sqlite3.Connection, dwh_ids: list[str]) -> None
     for row in results:
         conn.execute(
             "INSERT OR REPLACE INTO company_acquisitions "
-            "(dwhId, companyName, isAcquired, likelyAcquirer, status) VALUES (?, ?, ?, ?, ?)",
-            (row["dwhId"], row["companyName"], row["isAcquired"], row["likelyAcquirer"], row["status"]),
+            "(dwhId, companyName, isAcquired, acquirerName, rawName) VALUES (?, ?, ?, ?, ?)",
+            (row["dwhId"], row["companyName"], row["isAcquired"], row["acquirerName"], row["rawName"]),
         )
     conn.commit()
 
