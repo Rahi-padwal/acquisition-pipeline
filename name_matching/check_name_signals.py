@@ -144,6 +144,44 @@ def _names_match(a: str, b: str) -> bool:
     return a in b or b in a
 
 
+# Legal-entity suffixes and generic descriptors stripped by _company_identity_match()
+# before comparing two company names - "fabrikado GmbH" vs "fabrikado.com" or
+# "New Era Financial Group Inc" vs "New Era Financial Advisors" are the same
+# company under everyday naming variance, not a mismatch.
+_LEGAL_SUFFIX_WORDS = {
+    "inc", "llc", "llp", "ltd", "limited", "corp", "corporation", "co", "company",
+    "gmbh", "group", "grp", "plc", "srl", "sa", "ag", "pvt", "private", "ab",
+    "nv", "bv", "sarl", "kg", "oy", "as",
+}
+_DOMAIN_SUFFIX_RE = re.compile(r"\.(com|io|co|net|org)\b")
+_NON_WORD_RE = re.compile(r"[^\w\s]")
+
+
+def _normalize_company_identity(name: str) -> str:
+    text = _DOMAIN_SUFFIX_RE.sub("", (name or "").lower())
+    text = _NON_WORD_RE.sub(" ", text)
+    tokens = text.split()
+    while tokens and tokens[-1] in _LEGAL_SUFFIX_WORDS:
+        tokens.pop()
+    return " ".join(tokens)
+
+
+def _company_identity_match(a: str, b: str) -> bool:
+    """Looser than _names_match(): strips legal-entity suffixes/domain TLDs
+    and punctuation before comparing, and also tries a whitespace-free
+    comparison (catches "Wizco Media" vs "Wizcomedia"-style spacing drift).
+    Used to sanity-check that a structured acquiredBy record's
+    acquireeCompanyName actually refers to the company it's attached to -
+    see _check_structured_fields()."""
+    norm_a, norm_b = _normalize_company_identity(a), _normalize_company_identity(b)
+    if not norm_a or not norm_b:
+        return False
+    if norm_a in norm_b or norm_b in norm_a:
+        return True
+    compact_a, compact_b = norm_a.replace(" ", ""), norm_b.replace(" ", "")
+    return len(compact_a) >= 3 and len(compact_b) >= 3 and (compact_a in compact_b or compact_b in compact_a)
+
+
 def _is_valid_acquirer_candidate(candidate: str, self_name: str) -> bool:
     candidate = candidate.strip()
     if not (3 <= len(candidate) <= 50):
@@ -155,6 +193,97 @@ def _is_valid_acquirer_candidate(candidate: str, self_name: str) -> bool:
     if _names_match(candidate, self_name):
         return False
     return True
+
+
+def _is_self_truncation(candidate: str, self_name: str) -> bool:
+    """True when `candidate` is just `self_name` with a short trailing
+    suffix/acronym chopped off (e.g. candidate "Moore" vs self name
+    "Moore RMG") - a real acquirer is a distinct company, never a
+    truncation of the subject's own name.
+
+    Deliberately narrower than "candidate appears anywhere in self_name":
+    that would also flag legitimate cases where a company's own (long,
+    descriptive) name happens to end with its real acquirer's name, e.g.
+    "Authomize, now part of Delinea" genuinely contains "Delinea" - see
+    _check_structured_fields()'s docstring. Only a PREFIX match with a
+    short (<=2 word) remainder counts as a truncation, which targets the
+    "self name = candidate + suffix/acronym" shape specifically, without
+    rejecting a candidate that merely shows up later in a longer sentence.
+    """
+    candidate_norm = candidate.strip().lower()
+    self_norm = (self_name or "").strip().lower()
+    if not candidate_norm or not self_norm:
+        return False
+    if candidate_norm == self_norm:
+        return True
+    if not self_norm.startswith(candidate_norm):
+        return False
+    remainder = self_norm[len(candidate_norm) :].strip(" ,.-&")
+    return bool(remainder) and len(remainder.split()) <= 2 and len(remainder) <= 15
+
+
+# --- Confidence scoring -------------------------------------------------------
+#
+# Base score per matched_pattern, 0.0-1.0. This is the only place these
+# numbers live - adjust here, not per call site.
+_PATTERN_BASE_CONFIDENCE: dict[str, float] = {
+    "subsidiary_of": 1.0,               # "a wholly-owned subsidiary of X"
+    "owned_by": 1.0,                    # "owned by X" - same explicit-ownership tier
+    "part_of": 1.0,                     # "(now) part of X"
+    "acquired_by": 1.0,                 # "has been acquired by X"
+    "joined_forces_with": 1.0,          # "joined forces with X"
+    "operating_unit_of": 1.0,           # "an operating unit of X"
+    "division_of": 1.0,                 # "a division of X"
+    "acquirer_acquires_self": 1.0,      # "X acquires Company"
+    "a_x_company": 0.9,                 # "a X company"
+    "a_company_of": 0.9,                # "a company of X" - reverse of a_x_company, same family
+    "a_x_brand": 0.9,                   # "a X brand" - same family as a_x_company
+    "trading_as": 0.9,                  # "X, trading as Company"
+    "self_by_acquirer": 0.9,            # "Company by X"
+    "powered_by": 0.7,                  # "powered by X" - weakest explicit regex pattern
+    "structured_field": 1.0,            # ES's own isAcquired/acquiredBy fields; see modifier below
+    "funding_round_parenthetical": 0.7,  # "(part of X)" scraped from a funding-round label
+}
+
+
+def _base_confidence_for_pattern(matched_pattern: str) -> float:
+    return _PATTERN_BASE_CONFIDENCE.get(matched_pattern, 0.5)
+
+
+def _acquirer_corroborated_in_own_text(acquirer: str, raw: dict) -> bool:
+    """Modifier: does `acquirer` appear anywhere in the company's own
+    companyName, description, or linkedinProfileName? Used to sanity-check
+    structured-field acquirer names specifically - fundingAndInvestment.
+    acquiredBy sometimes holds a mislinked/chained transaction (see
+    _check_structured_fields()'s docstring); if the acquirer's name is
+    nowhere in the company's own text, that's a corroboration gap worth
+    flagging even after the acquiree-name guard already let it through."""
+    acquirer_norm = acquirer.strip().lower()
+    if not acquirer_norm:
+        return False
+    haystacks = (raw.get("companyName"), raw.get("description"), raw.get("linkedinProfileName"))
+    return any(acquirer_norm in (haystack or "").lower() for haystack in haystacks)
+
+
+def _score_match(match: dict, raw: dict) -> dict:
+    """Attach confidence_score/confidence_notes to `match` (mutates and
+    returns it). Only the structured-field-uncorroborated modifier is
+    applied here, since it only needs this one record's own raw text.
+    Cross-source modifiers (corroboration/conflict against the description-
+    based path) need that path's output too and live one level up, in
+    combined_matching/combined_check.py, the one place both detectors'
+    results are visible together."""
+    matched_pattern = match["matched_pattern"]
+    score = _base_confidence_for_pattern(matched_pattern)
+    notes = None
+    if matched_pattern == "structured_field" and not _acquirer_corroborated_in_own_text(
+        match["candidate_name"], raw
+    ):
+        score = min(score, 0.4)
+        notes = "structured_field_uncorroborated"
+    match["confidence_score"] = score
+    match["confidence_notes"] = notes
+    return match
 
 
 def find_acquirer_in_name(company_name: str) -> dict | None:
@@ -192,6 +321,18 @@ def _check_structured_fields(raw: dict, record_company_id: str) -> dict | None:
     Self-reference is guarded via acquirerCompanyId vs the record's own
     companyId, not a name substring check - companyName routinely already
     contains the acquirer's name (e.g. "Authomize, now part of Delinea").
+
+    Also guarded against a chained-acquisition attachment error seen
+    upstream: fundingAndInvestment.acquiredBy sometimes holds a LATER,
+    unrelated transaction that has nothing to do with this record (e.g. a
+    company that was itself acquired, whose subsequent-acquisition-by-a-
+    third-party ends up linked here instead of its own acquisition). The
+    tell is acquireeCompanyName not resembling this record's own
+    companyName at all - a genuine acquiredBy entry for THIS company should
+    name THIS company (or a recognizable past name of it) as the acquiree.
+    When it doesn't, don't trust acquirerCompanyName either; returning None
+    here lets the caller fall through to name-regex / description-based
+    detection instead of returning a confident but wrong acquirer.
     """
     if not raw.get("isAcquired"):
         return None
@@ -209,6 +350,10 @@ def _check_structured_fields(raw: dict, record_company_id: str) -> dict | None:
         return None
 
     company_name = raw.get("companyName", "")
+    acquiree_name = (acquired_by.get("acquireeCompanyName") or "").strip()
+    if acquiree_name and not _company_identity_match(acquiree_name, company_name):
+        return None
+
     return {
         "candidate_name": acquirer,
         "matched_pattern": "structured_field",
@@ -254,16 +399,32 @@ def _check_funding_milestones(raw: dict, self_name: str) -> dict | None:
 
 def check_company_record(record) -> dict | None:
     """Check a CompanyRecord for an acquirer: structured fields, then name
-    regex, then funding-round parenthetical, in that order."""
-    structured = _check_structured_fields(record.raw, record.company_id)
-    if structured is not None:
-        return structured
+    regex, then funding-round parenthetical, in that order.
 
-    name_match = find_acquirer_in_name(record.company_name)
-    if name_match is not None:
-        return name_match
+    Every candidate from every detector is run through
+    _is_self_truncation() against that detector's own notion of "self"
+    before being accepted, regardless of which one produced it - this is
+    the one place all three paths funnel through, so it's the one place a
+    truncation-of-own-name candidate (e.g. "Moore" from "Moore RMG") gets
+    caught no matter which detector let it slip past its own checks (or,
+    in _check_structured_fields()'s case, had no such check at all).
+    """
+    for detector in (
+        lambda: _check_structured_fields(record.raw, record.company_id),
+        lambda: find_acquirer_in_name(record.company_name),
+        lambda: _check_funding_milestones(record.raw, record.company_name),
+    ):
+        match = detector()
+        if match is None:
+            continue
+        # Rejection takes priority over scoring: a self-truncated candidate
+        # never reaches _score_match() - it's `continue`d past entirely, not
+        # scored low and returned.
+        if _is_self_truncation(match["candidate_name"], match["self_name"]):
+            continue
+        return _score_match(match, record.raw)
 
-    return _check_funding_milestones(record.raw, record.company_name)
+    return None
 
 
 def _domain_key(record: CompanyRecord) -> str:
@@ -298,6 +459,8 @@ def _positive_result(record: CompanyRecord, match: dict) -> dict:
         "company_name": record.company_name,
         "is_acquired": True,
         "likely_acquirer": match["candidate_name"],
+        "confidence_score": match.get("confidence_score"),
+        "confidence_notes": match.get("confidence_notes"),
         "evidence": [
             {
                 "candidate_name": match["candidate_name"],
@@ -315,6 +478,8 @@ def _not_found_result(query: str) -> dict:
         "company_name": query,
         "is_acquired": False,
         "likely_acquirer": None,
+        "confidence_score": None,
+        "confidence_notes": None,
         "evidence": [],
         "status": "not_found",
     }
@@ -326,6 +491,8 @@ def _not_acquired_result(record: CompanyRecord) -> dict:
         "company_name": record.company_name,
         "is_acquired": False,
         "likely_acquirer": None,
+        "confidence_score": None,
+        "confidence_notes": None,
         "evidence": [],
         "status": "checked",
     }
@@ -378,6 +545,8 @@ def run_name_check(company_id: str, data_source: CompanyDataSource) -> dict:
             "company_name": None,
             "is_acquired": False,
             "likely_acquirer": None,
+            "confidence_score": None,
+            "confidence_notes": None,
             "evidence": [],
             "status": "not_found",
         }
@@ -389,15 +558,24 @@ def run_name_check(company_id: str, data_source: CompanyDataSource) -> dict:
             "company_name": record.company_name,
             "is_acquired": False,
             "likely_acquirer": None,
+            "confidence_score": None,
+            "confidence_notes": None,
             "evidence": [],
             "status": "checked",
         }
+
+    # find_acquirer_in_name() only ever produces companyName-regex matches
+    # (never structured_field), so the structured-field-uncorroborated
+    # modifier never applies here - a plain base-score lookup is enough.
+    confidence_score = _base_confidence_for_pattern(match["matched_pattern"])
 
     return {
         "company_id": company_id,
         "company_name": record.company_name,
         "is_acquired": True,
         "likely_acquirer": match["candidate_name"],
+        "confidence_score": confidence_score,
+        "confidence_notes": None,
         "evidence": [
             {
                 "candidate_name": match["candidate_name"],

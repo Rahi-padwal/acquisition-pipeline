@@ -38,6 +38,8 @@ class CheckNameResponse(BaseModel):
     company_name: str
     is_acquired: bool
     likely_acquirer: str | None
+    confidence_score: float | None
+    confidence_notes: str | None
     evidence: list[Evidence]
 
 
@@ -50,5 +52,7 @@ async def check_name(dwh_id: str) -> CheckNameResponse:
         company_name=result["company_name"],
         is_acquired=result["is_acquired"],
         likely_acquirer=result["likely_acquirer"],
+        confidence_score=result.get("confidence_score"),
+        confidence_notes=result.get("confidence_notes"),
         evidence=[Evidence(**e) for e in result["evidence"]],
     )

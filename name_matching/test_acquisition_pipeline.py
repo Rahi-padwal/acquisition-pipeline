@@ -42,7 +42,7 @@ _SOURCE_FIELDS = [
     "linkedinProfileName",
 ]
 
-DWH_COUNT = 1000
+DWH_COUNT = 10
 
 # Acquirer name: starts alnum, up to 50 more name-shaped chars, non-greedy.
 _ACQUIRER_CAPTURE = r"(?P<acquirer>[A-Za-z0-9][\w&.,' -]{1,50}?)"
@@ -107,8 +107,16 @@ def _search_with_retry(dwh_id: str) -> dict[str, Any]:
 
 
 def get_dwh_ids(size: int) -> list[str]:
+    """Random sample of `size` dwhIds, restricted to companies that have a
+    categoriesLLM2 value populated (via random_score, not the first N by
+    index order)."""
     resp = _es_search_with_retry(
-        query={"match_all": {}},
+        query={
+            "function_score": {
+                "query": {"exists": {"field": "categoriesLLM2.keyword"}},
+                "random_score": {},
+            }
+        },
         source=["dwhId"],
         size=size,
     )

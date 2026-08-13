@@ -108,6 +108,33 @@ def _clean_acquirer(raw: str) -> str:
     return re.sub(r"\s+", " ", raw).strip().strip(")").strip()
 
 
+# --- Confidence scoring -------------------------------------------------------
+#
+# Base score per matched_pattern, 0.0-1.0. This is the only place these
+# numbers live - adjust here, not per call site. "formerly" is included for
+# completeness/documentation even though it's currently unreachable as a
+# scored positive match (extract_acquirer_from_description() never returns
+# an acquirerCompany for a standalone "formerly" - see that function's
+# docstring); if that demotion is ever revisited, the score is already here.
+#
+# Cross-source modifiers (corroboration/conflict against the companyName-
+# based path) are NOT applied here - this module only sees the description
+# field in isolation, so that logic lives in combined_matching/combined_check.py,
+# the one place both detectors' outputs are visible together.
+_PATTERN_BASE_CONFIDENCE: dict[str, float] = {
+    "was_acquired_by": 1.0,
+    "wholly_owned_subsidiary": 1.0,
+    "is_now": 1.0,
+    "joined_forces": 0.7,
+    "stay_up_to_date": 0.5,
+    "formerly": 0.3,
+}
+
+
+def _base_confidence_for_pattern(matched_pattern: str) -> float:
+    return _PATTERN_BASE_CONFIDENCE.get(matched_pattern, 0.5)
+
+
 def extract_acquirer_from_description(description: str | None) -> dict[str, Any] | None:
     """Scan `description` for acquisition-indicating phrases.
 
@@ -153,6 +180,7 @@ def extract_acquirer_from_description(description: str | None) -> dict[str, Any]
             "acquirerCompany": None,
             "matchedPattern": "formerly",
             "confidence": "low",
+            "confidenceScore": _base_confidence_for_pattern("formerly"),
             "nameChanged": True,
             "isLikelyAcquirer": True,
             "rawText": formerly_match.group(0) if formerly_match else "formerly",
@@ -170,6 +198,7 @@ def extract_acquirer_from_description(description: str | None) -> dict[str, Any]
                 "acquirerCompany": _clean_acquirer(m.group("acquirer")),
                 "matchedPattern": pattern_name,
                 "confidence": "high",
+                "confidenceScore": _base_confidence_for_pattern(pattern_name),
                 # formerly demoted: a same-text "formerly" mention no longer
                 # drives its own match, it just rides along as evidence that
                 # the name also changed alongside this stronger signal.
@@ -189,6 +218,7 @@ def extract_acquirer_from_description(description: str | None) -> dict[str, Any]
             "acquirerCompany": None,
             "matchedPattern": "formerly",
             "confidence": "low",
+            "confidenceScore": _base_confidence_for_pattern("formerly"),
             "nameChanged": True,
             "isLikelyAcquirer": False,
             "rawText": formerly_match.group(0),
@@ -200,6 +230,7 @@ def extract_acquirer_from_description(description: str | None) -> dict[str, Any]
             "acquirerCompany": _clean_acquirer(stay_up_to_date_match.group("acquirer")),
             "matchedPattern": "stay_up_to_date",
             "confidence": "low",
+            "confidenceScore": _base_confidence_for_pattern("stay_up_to_date"),
             "nameChanged": False,
             "isLikelyAcquirer": False,
             "rawText": stay_up_to_date_match.group(0),
@@ -248,6 +279,8 @@ def _not_acquired_result(dwh_id: str, company_name: str | None) -> dict[str, Any
         "company_name": company_name,
         "is_acquired": False,
         "likely_acquirer": None,
+        "confidence_score": None,
+        "confidence_notes": None,
         "evidence": [],
     }
 
@@ -269,6 +302,11 @@ def _build_result(dwh_id: str, source: dict[str, Any] | None) -> dict[str, Any]:
         "company_name": company_name,
         "is_acquired": True,
         "likely_acquirer": match["acquirerCompany"],
+        # No cross-source modifiers here - this module only sees the
+        # description field, so confidence_notes stays None unless a future
+        # caller (e.g. combined_check.py) recomputes it with more context.
+        "confidence_score": match["confidenceScore"],
+        "confidence_notes": None,
         "evidence": [
             {
                 "candidate_name": match["acquirerCompany"],
@@ -291,6 +329,8 @@ def fetch_and_detect(dwh_id: str, es_client: Elasticsearch) -> dict[str, Any]:
             "company_name": None,
             "is_acquired": None,
             "likely_acquirer": None,
+            "confidence_score": None,
+            "confidence_notes": None,
             "evidence": [],
         }
 
@@ -315,6 +355,8 @@ class DetectionResult(BaseModel):
     company_name: str | None
     is_acquired: bool | None
     likely_acquirer: str | None
+    confidence_score: float | None
+    confidence_notes: str | None
     evidence: list[Evidence]
 
 
