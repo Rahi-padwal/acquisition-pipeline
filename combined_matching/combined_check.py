@@ -19,8 +19,11 @@ see _apply_cross_source_modifiers() below.
 
 from __future__ import annotations
 
+import logging
 import sys
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 _ROOT = Path(__file__).resolve().parent.parent
 for _subdir in ("name_matching", "description_matching"):
@@ -79,6 +82,93 @@ def _apply_cross_source_modifiers(
     if _company_identity_match(primary_acquirer, other_acquirer):
         return min(_CORROBORATION_CAP, primary_score + _CORROBORATION_BONUS), "corroborated_by_both_sources"
     return min(primary_score, _CONFLICT_CAP), "source_conflict"
+
+
+# --- Post-hoc structured-field confidence boost ------------------------------
+#
+# Manual spot-checking found that when a row's confidence is low/moderate
+# because the text-based pattern match is weak or absent, the raw ES field
+# fundingAndInvestment.acquiredBy.acquirerCompanyName is often still correct
+# even with ZERO corroborating acquisition language anywhere in the company's
+# own text (e.g. Nuvance Health, acquired by Northwell Health - no
+# acquisition language in the description at all, yet the structured field
+# was accurate). This step nudges the score up in that situation. It is a
+# blunt, manually-tuned correction (not a new detector), which is exactly why
+# the thresholds/targets are pulled out as named constants here instead of
+# being buried as magic numbers inline - keep it that way so it's easy to
+# find and retune later.
+#
+# Runs strictly AFTER the base pattern score and all existing modifiers
+# (corroboration bonus, structured-field-uncorroborated cap, substring-
+# rejection, conflict cap) have already produced `score`/`notes` - this is an
+# additional final-adjustment layer, not a replacement for any of that.
+_STRUCTURED_FIELD_BOOST_LOW_MAX = 0.5   # score <= this -> boosted to _LOW_TARGET
+_STRUCTURED_FIELD_BOOST_MID_MAX = 0.7   # _LOW_MAX < score <= this -> boosted to _MID_TARGET
+_STRUCTURED_FIELD_BOOST_LOW_TARGET = 0.7
+_STRUCTURED_FIELD_BOOST_MID_TARGET = 0.8
+
+# Set by check_name_signals._score_match() when a structured_field match's
+# acquirer name doesn't appear anywhere in the company's own text - see that
+# module. Duplicated here as a literal (rather than imported) since it's a
+# string constant, not shared logic; keep the two in sync if it ever changes.
+_STRUCTURED_FIELD_UNCORROBORATED_NOTE = "structured_field_uncorroborated"
+
+
+def _structured_field_acquirer_name(raw: dict) -> str:
+    """Read fundingAndInvestment.acquiredBy.acquirerCompanyName straight off
+    the raw record, same lookup check_name_signals._check_structured_fields()
+    does. Independent of whatever ended up in acquirerCompany/likely_acquirer
+    - this function only asks "is the structured field itself populated?"."""
+    acquired_by = (raw.get("fundingAndInvestment") or {}).get("acquiredBy") or {}
+    if isinstance(acquired_by, list):
+        acquired_by = acquired_by[0] if acquired_by else {}
+    return (acquired_by.get("acquirerCompanyName") or "").strip()
+
+
+def _apply_structured_field_confidence_boost(
+    score: float | None, notes: str | None, raw: dict
+) -> tuple[float | None, str | None]:
+    """Final post-processing adjustment: bump `score` up when the raw
+    structured field has an acquirer name, per the two thresholds above.
+    Must be called LAST, after every other score/notes computation for this
+    row is finished.
+
+    Only adjusts the score - never touches acquirerCompany, source,
+    matchedPattern, or isAcquired. Whether to also backfill acquirerCompany
+    from the structured field when it's currently empty is a separate
+    question, out of scope here.
+
+    Deliberately a no-op when `notes` already says the structured-field-
+    uncorroborated cap fired (see check_name_signals._score_match): that cap
+    and this boost are two different conclusions about the exact same
+    signal (structured field present, no text corroboration) pulling in
+    opposite directions, and nothing has specified which one should win. So
+    rather than silently guessing, this logs the conflict and leaves the
+    existing (capped) score untouched - revisit explicitly if that turns out
+    to happen a lot.
+    """
+    if score is None:
+        return score, notes
+
+    structured_acquirer = _structured_field_acquirer_name(raw)
+    if not structured_acquirer:
+        return score, notes
+
+    if notes == _STRUCTURED_FIELD_UNCORROBORATED_NOTE:
+        logger.warning(
+            "structured-field confidence boost skipped: row already capped by "
+            "structured_field_uncorroborated (score=%s, structured acquirer=%r) "
+            "- priority between the cap and the boost is undecided, cap wins",
+            score,
+            structured_acquirer,
+        )
+        return score, notes
+
+    if score <= _STRUCTURED_FIELD_BOOST_LOW_MAX:
+        return _STRUCTURED_FIELD_BOOST_LOW_TARGET, notes
+    if score <= _STRUCTURED_FIELD_BOOST_MID_MAX:
+        return _STRUCTURED_FIELD_BOOST_MID_TARGET, notes
+    return score, notes
 
 
 def _not_found_result(dwh_id: str) -> dict:
@@ -187,6 +277,11 @@ def run_combined_check(dwh_id: str, data_source: CompanyDataSource) -> dict:
                 }
             ]
 
+        # Final post-processing step, applied after every score/notes
+        # computation above - see _apply_structured_field_confidence_boost()'s
+        # docstring.
+        score, notes = _apply_structured_field_confidence_boost(score, notes, record.raw)
+
         return _positive_result(
             record,
             name_match["candidate_name"],
@@ -201,14 +296,17 @@ def run_combined_check(dwh_id: str, data_source: CompanyDataSource) -> dict:
     if description_acquirer is not None:
         # name_match is None here, so there's no second candidate to
         # corroborate or conflict with - cross-source modifiers can't apply.
+        description_score, description_notes = _apply_structured_field_confidence_boost(
+            description_match["confidenceScore"], None, record.raw
+        )
         return _positive_result(
             record,
             description_acquirer,
             description_match["matchedPattern"],
             description_match["rawText"],
             source="description",
-            confidence_score=description_match["confidenceScore"],
-            confidence_notes=None,
+            confidence_score=description_score,
+            confidence_notes=description_notes,
         )
 
     return _not_acquired_result(record)

@@ -56,10 +56,72 @@ _WHOLLY_OWNED_SUBSIDIARY = re.compile(
     r"operates\s+as\s+an?\s+wholly[\s-]+owned\s+subsidiary\s+of\s+(?P<acquirer>" + _NAME_CAPTURE + r")" + _NAME_TERMINATOR,
     re.IGNORECASE,
 )
-_JOINED_FORCES = re.compile(
-    r"has\s+joined\s+forces\s+with\s+(?P<acquirer>" + _NAME_CAPTURE + r")" + _NAME_TERMINATOR,
+# --- joined_forces-specific list/partnership guard ---------------------------
+#
+# "has joined forces with X" is genuinely ambiguous in the wild: the same
+# phrasing shows up both for real acquisitions ("has joined forces with Acme
+# Corp") AND for partnership/client-roster announcements ("has joined forces
+# with industry giants like Acme Corp", "has joined forces with Acme, Beta,
+# and Gamma") - the latter names a PARTNER or CLIENT, not an acquirer, and
+# should never be extracted as a confident single acquirer. Two independent,
+# vocabulary-general signals catch this shape without hardcoding any specific
+# company or noun list:
+#   (1) a list-introducing connector ("like" / "such as" / "including" / ...)
+#       sitting between the trigger phrase and the captured name - catches
+#       "industry giants like X", "leading companies such as X", "clients
+#       including X", etc. regardless of which noun precedes the connector.
+#   (2) multiple comma- or "and"-joined capitalized names attached to the
+#       captured name (either right after it, or "and"-joined inside it) -
+#       catches "has joined forces with X, Y, and Z" even when there's no
+#       connector word at all.
+# Either signal firing means this match is discarded entirely rather than
+# scored (see the joined_forces branch in extract_acquirer_from_description).
+_JOINED_FORCES_LIST_CONNECTOR = re.compile(
+    r"(?:like|such\s+as|including|comprising|e\.g\.?|to\s+name\s+(?:a\s+few|just\s+one|but\s+a\s+few))\s*$",
     re.IGNORECASE,
 )
+_JOINED_FORCES_MULTI_ENTITY_TAIL = re.compile(r"^(?:,\s*[A-Z][\w&.'-]*|\s+and\s+[A-Z])")
+# Deliberately NOT re.IGNORECASE: "and" joining two separate entities inside
+# the captured name (e.g. "Acme and Beta") is only a reliable list signal
+# when "and" is lowercase and what follows is capitalized like a new proper
+# noun - a real two-word company name containing "and" ("Johnson and
+# Johnson"-style) can still slip through here, accepted as a rare tradeoff.
+_JOINED_FORCES_MULTI_ENTITY_INTERNAL_AND = re.compile(r"[\w&.'-]+\s+and\s+[A-Z]")
+
+# Filler words between "joined forces with" and the actual acquirer name
+# ("industry giants like ", "leading companies such as ") are skipped
+# generically - any run of lowercase-initial words - rather than captured, so
+# the acquirer capture starts at the first proper-noun-like (capitalized)
+# token instead of the first word after the trigger phrase. (?-i:...) turns
+# case-folding off locally so this stays genuinely case-sensitive even though
+# the rest of the pattern is compiled with re.IGNORECASE. Tradeoff: a real
+# acquirer name stylized entirely in lowercase won't be captured by this
+# pattern; accepted as rare relative to the false-positive rate this fixes.
+_JOINED_FORCES_FILLER = r"(?:(?-i:[a-z][\w'-]*)\s+){0,4}"
+_JOINED_FORCES_ACQUIRER_CAPTURE = r"(?-i:[A-Z])[^,.;:()\n]{0,49}?"
+
+_JOINED_FORCES = re.compile(
+    r"has\s+joined\s+forces\s+with\s+" + _JOINED_FORCES_FILLER
+    + r"(?P<acquirer>" + _JOINED_FORCES_ACQUIRER_CAPTURE + r")" + _NAME_TERMINATOR,
+    re.IGNORECASE,
+)
+
+
+def _is_joined_forces_list_announcement(text: str, match: re.Match) -> bool:
+    """True when a _JOINED_FORCES match looks like a partnership/client-list
+    announcement rather than a genuine single-acquirer acquisition phrase -
+    see the module-level comment above _JOINED_FORCES_LIST_CONNECTOR for the
+    two signals checked."""
+    lead = match.group(0)[: match.start("acquirer") - match.start(0)]
+    if _JOINED_FORCES_LIST_CONNECTOR.search(lead):
+        return True
+
+    acquirer_text = match.group("acquirer")
+    if _JOINED_FORCES_MULTI_ENTITY_INTERNAL_AND.search(acquirer_text):
+        return True
+
+    tail = text[match.end("acquirer") : match.end("acquirer") + 60]
+    return bool(_JOINED_FORCES_MULTI_ENTITY_TAIL.match(tail))
 _FORMERLY = re.compile(
     r"\bformerly\s+(?:known\s+as\s+)?(?P<acquirer>" + _NAME_CAPTURE + r")" + _NAME_TERMINATOR,
     re.IGNORECASE,
@@ -193,6 +255,12 @@ def extract_acquirer_from_description(description: str | None) -> dict[str, Any]
         ("is_now", _IS_NOW),
     ):
         m = pattern.search(text)
+        if m and pattern_name == "joined_forces" and _is_joined_forces_list_announcement(text, m):
+            # Partnership/client-list announcement, not an acquisition - see
+            # _is_joined_forces_list_announcement(). Discard entirely (don't
+            # score, don't return) rather than picking one name out of the
+            # list; the remaining patterns below still get a chance to match.
+            m = None
         if m:
             return {
                 "acquirerCompany": _clean_acquirer(m.group("acquirer")),

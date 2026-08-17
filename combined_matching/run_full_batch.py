@@ -8,12 +8,17 @@ through the FULL matching set via search_after, sorted by dwhId.keyword
 (dwhId itself is mapped `text`, not sortable directly - ES rejects sorting
 on analyzed text fields; dwhId.keyword is the companion keyword sub-field,
 same pattern as companyName.keyword / companyWebsiteDomain.keyword
-elsewhere in this project). Checkpointed: the last dwhId processed is written to
-CHECKPOINT_PATH after every page, so a crash or Ctrl+C can be resumed by
-just running this again rather than restarting from page 1 - relevant at
-this scale, since ~768 page-fetches means the cluster's known intermittent
-404 flakiness (see _search_with_retry() elsewhere in this project) is very
-likely to be hit at least once over a full run.
+elsewhere in this project). search_after always uses ES's own "sort" value
+from the last hit in a page (see fetch_page()) - never a field re-read out
+of that hit's own _source, which can be missing or shaped unexpectedly (a
+raw document occasionally has no usable dwhId at all; such hits are logged
+and skipped for detection, but pagination still advances past them using
+the sort value ES already gave us for that hit). Checkpointed: that sort
+value is written to CHECKPOINT_PATH after every page, so a crash or Ctrl+C
+can be resumed by just running this again rather than restarting from page
+1 - relevant at this scale, since ~768 page-fetches means the cluster's
+known intermittent 404 flakiness (see _search_with_retry() elsewhere in
+this project) is very likely to be hit at least once over a full run.
 
 Reuses everything rather than reimplementing:
 - check_company_record() / extract_acquirer_from_description() - the same
@@ -52,7 +57,7 @@ for _subdir in ("name_matching", "description_matching"):
         sys.path.insert(0, _path)
 
 from check_name_signals import check_company_record  # noqa: E402 (from name_matching)
-from data_source import CompanyRecord  # noqa: E402 (from name_matching)
+from data_source import CompanyRecord, normalize_company_source  # noqa: E402 (from name_matching)
 from description_detection_api import extract_acquirer_from_description  # noqa: E402 (from description_matching)
 
 from fetch_snapshot import _SOURCE_FIELDS  # noqa: E402
@@ -95,15 +100,35 @@ def _load_checkpoint() -> dict[str, Any]:
     if not path.exists():
         return {"last_dwh_id": None, "processed": 0}
     with path.open("r", encoding="utf-8") as f:
-        return json.load(f)
+        checkpoint = json.load(f)
+
+    # Backward compat: checkpoints written before this fix stored a plain
+    # dwhId string here, extracted from a hit's own _source. This fix
+    # switches to using ES's own "sort" array for search_after instead (see
+    # fetch_page()) - but dwhId.keyword is an unanalyzed keyword field, so
+    # that old plain string IS exactly the value ES's sort array would have
+    # held. Wrap it so an old checkpoint still resumes correctly.
+    last = checkpoint.get("last_dwh_id")
+    if isinstance(last, str):
+        checkpoint["last_dwh_id"] = [last]
+    return checkpoint
 
 
-def _save_checkpoint(last_dwh_id: str | None, processed: int) -> None:
+def _save_checkpoint(search_after: list[Any] | None, processed: int) -> None:
     with open(CHECKPOINT_PATH, "w", encoding="utf-8") as f:
-        json.dump({"last_dwh_id": last_dwh_id, "processed": processed}, f)
+        json.dump({"last_dwh_id": search_after, "processed": processed}, f)
 
 
-def fetch_page(es: Elasticsearch, search_after: str | None) -> list[dict[str, Any]]:
+def fetch_page(
+    es: Elasticsearch, search_after: list[Any] | None
+) -> tuple[list[dict[str, Any]], list[Any] | None, int]:
+    """Returns (usable company sources, ES's own "sort" value for this
+    page's last hit, raw hit count). search_after pagination must always
+    use that "sort" value - never anything re-extracted from a hit's own
+    fields, which may be missing or shaped unexpectedly (see the module
+    docstring). raw hit count is tracked separately from len(sources)
+    because a hit can be skipped below without affecting how many more
+    pages there are to fetch."""
     body: dict[str, Any] = {
         "size": PAGE_SIZE,
         "query": _EXISTS_QUERY,
@@ -111,25 +136,40 @@ def fetch_page(es: Elasticsearch, search_after: str | None) -> list[dict[str, An
         "_source": _SOURCE_FIELDS,
     }
     if search_after is not None:
-        body["search_after"] = [search_after]
+        body["search_after"] = search_after
 
     resp = _search_with_retry(es, body)
     hits = resp["hits"]["hits"]
 
     sources = []
     for hit in hits:
-        source = hit.get("_source", {})
+        source = hit.get("_source")
+        if not source or not source.get("dwhId"):
+            logger.warning(
+                "hit _id=%s has no usable _source/dwhId - skipping for detection, "
+                "still advancing pagination past it",
+                hit.get("_id"),
+            )
+            continue
         if not source.get("companyId"):
             source["companyId"] = hit.get("_id", "")
         sources.append(source)
-    return sources
+
+    last_sort = hits[-1]["sort"] if hits else None
+    return sources, last_sort, len(hits)
 
 
 def process_company(source: dict[str, Any]) -> dict[str, Any]:
     """Never raises - failures come back as isAcquired=None instead of
-    dropping the company from the batch."""
+    dropping the company from the batch.
+
+    normalize_company_source() runs first and mutates `source` in place, so
+    even the except branch below sees already-cleaned values (e.g.
+    companyName as a plain string, not a stray ES-returned list) rather
+    than the raw field that caused the failure in the first place."""
     dwh_id = source.get("dwhId", "")
     try:
+        source = normalize_company_source(source)
         record = CompanyRecord(
             company_id=str(source.get("companyId") or ""),
             company_name=source.get("companyName", ""),
@@ -137,7 +177,7 @@ def process_company(source: dict[str, Any]) -> dict[str, Any]:
         )
         name_match = check_company_record(record)
         description_match = extract_acquirer_from_description(record.raw.get("description"))
-        combined = _combine_results(name_match, description_match)
+        combined = _combine_results(name_match, description_match, record.raw)
 
         return {"dwhId": dwh_id, "companyName": record.company_name, **combined}
     except Exception:
@@ -151,6 +191,18 @@ def process_company(source: dict[str, Any]) -> dict[str, Any]:
             "matchedPattern": None,
             "confidenceScore": None,
         }
+
+
+def _to_sqlite_value(value: Any) -> Any:
+    """SQLite only binds None/int/float/str/bytes. Coerce anything else
+    (e.g. a list that slipped past normalize_company_source() for some
+    field this batch doesn't even normalize) to a string instead of letting
+    conn.execute() raise sqlite3.ProgrammingError and abort the page's
+    entire insert loop over one bad row - this is the backstop fix #3 asks
+    for, independent of fix #1's normalization at the source."""
+    if value is None or isinstance(value, (int, float, str, bytes)):
+        return value
+    return str(value)
 
 
 def _create_table(conn: sqlite3.Connection) -> None:
@@ -180,8 +232,11 @@ def run_batch(es: Elasticsearch, conn: sqlite3.Connection) -> None:
 
     start = time.time()
     while True:
-        page = fetch_page(es, search_after)
-        if not page:
+        page, last_sort, raw_hit_count = fetch_page(es, search_after)
+        if raw_hit_count == 0:
+            # Zero raw hits (not just zero usable sources - a page can be
+            # non-empty but have every hit skipped for a missing dwhId, and
+            # that's not "done", just an unusually bad page).
             break
 
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
@@ -189,31 +244,45 @@ def run_batch(es: Elasticsearch, conn: sqlite3.Connection) -> None:
             results = [future.result() for future in as_completed(futures)]
 
         for row in results:
-            conn.execute(
-                "INSERT OR REPLACE INTO combined_acquisitions "
-                "(dwhId, companyName, isAcquired, acquirerCompany, source, matchedPattern, confidenceScore) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (
-                    row["dwhId"],
-                    row["companyName"],
-                    row["isAcquired"],
-                    row["acquirerCompany"],
-                    row["source"],
-                    row["matchedPattern"],
-                    row["confidenceScore"],
-                ),
-            )
+            dwh_id_value = _to_sqlite_value(row.get("dwhId"))
+            try:
+                conn.execute(
+                    "INSERT OR REPLACE INTO combined_acquisitions "
+                    "(dwhId, companyName, isAcquired, acquirerCompany, source, matchedPattern, confidenceScore) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        dwh_id_value,
+                        _to_sqlite_value(row.get("companyName")),
+                        _to_sqlite_value(row.get("isAcquired")),
+                        _to_sqlite_value(row.get("acquirerCompany")),
+                        _to_sqlite_value(row.get("source")),
+                        _to_sqlite_value(row.get("matchedPattern")),
+                        _to_sqlite_value(row.get("confidenceScore")),
+                    ),
+                )
+            except Exception:
+                # Belt-and-suspenders: _to_sqlite_value() should already
+                # prevent this, but one bad row must never abort the rest
+                # of the page's writes or crash the batch - record it as an
+                # error row instead of losing it silently.
+                logger.exception("dwhId %s: failed to write to SQLite even after coercion", dwh_id_value)
+                conn.execute(
+                    "INSERT OR REPLACE INTO combined_acquisitions "
+                    "(dwhId, companyName, isAcquired, acquirerCompany, source, matchedPattern, confidenceScore) "
+                    "VALUES (?, NULL, NULL, NULL, NULL, NULL, NULL)",
+                    (dwh_id_value,),
+                )
         conn.commit()
 
         processed += len(page)
-        search_after = page[-1]["dwhId"]
+        search_after = last_sort
         _save_checkpoint(search_after, processed)
 
         if processed % PROGRESS_EVERY < PAGE_SIZE:
             elapsed = time.time() - start
             logger.info("Processed %d companies so far (%.1fs elapsed)", processed, elapsed)
 
-        if len(page) < PAGE_SIZE:
+        if raw_hit_count < PAGE_SIZE:
             break
 
     elapsed = time.time() - start

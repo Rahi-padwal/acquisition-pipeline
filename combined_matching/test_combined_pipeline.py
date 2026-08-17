@@ -43,6 +43,7 @@ for _subdir in ("name_matching", "description_matching"):
         sys.path.insert(0, _path)
 
 from check_name_signals import _company_identity_match, check_company_record  # noqa: E402 (from name_matching)
+from combined_check import _apply_structured_field_confidence_boost  # noqa: E402
 from data_source import CompanyDataSource, ElasticCompanyDataSource  # noqa: E402 (from name_matching)
 from description_detection_api import extract_acquirer_from_description  # noqa: E402 (from description_matching)
 from json_data_source import JsonCompanyDataSource  # noqa: E402
@@ -101,7 +102,11 @@ def get_random_dwh_ids(es: Elasticsearch, size: int) -> list[str]:
     return [hit["_source"]["dwhId"] for hit in resp["hits"]["hits"] if hit["_source"].get("dwhId")]
 
 
-def _combine_results(name_match: dict[str, Any] | None, description_match: dict[str, Any] | None) -> dict[str, Any]:
+def _combine_results(
+    name_match: dict[str, Any] | None,
+    description_match: dict[str, Any] | None,
+    raw: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Merge the two detectors' outputs into one verdict:
     - both agree on the acquirer -> source="both", higher confidence score kept
     - only one path has a match -> that path's result, source="company_name"/"description"
@@ -109,6 +114,12 @@ def _combine_results(name_match: dict[str, Any] | None, description_match: dict[
       kept as the recorded acquirer (never silently dropped - the other
       candidate is visible in the warning log)
     - neither matches -> no acquirer at all
+
+    `raw` (the company's raw ES source) is optional only for backward
+    compatibility with old call sites - pass it so the final
+    _apply_structured_field_confidence_boost() post-processing step below can
+    see fundingAndInvestment.acquiredBy.acquirerCompanyName; without it, that
+    step is skipped.
     """
     description_acquirer = (
         description_match["acquirerCompany"]
@@ -120,21 +131,32 @@ def _combine_results(name_match: dict[str, Any] | None, description_match: dict[
         return {"isAcquired": 0, "acquirerCompany": None, "source": None, "matchedPattern": None, "confidenceScore": None}
 
     if name_match is not None and description_acquirer is None:
+        matched_pattern = name_match["matched_pattern"]
+        score = name_match.get("confidence_score")
+        # Uncorroborated cap only exists on the name-match side (see
+        # check_name_signals._score_match), so it's the only notes value the
+        # boost step needs to know about here.
+        notes = name_match.get("confidence_notes") if matched_pattern == "structured_field" else None
+        if raw is not None:
+            score, _ = _apply_structured_field_confidence_boost(score, notes, raw)
         return {
             "isAcquired": 1,
             "acquirerCompany": name_match["candidate_name"],
             "source": "company_name",
-            "matchedPattern": name_match["matched_pattern"],
-            "confidenceScore": name_match.get("confidence_score"),
+            "matchedPattern": matched_pattern,
+            "confidenceScore": score,
         }
 
     if name_match is None and description_acquirer is not None:
+        score = description_match.get("confidenceScore")
+        if raw is not None:
+            score, _ = _apply_structured_field_confidence_boost(score, None, raw)
         return {
             "isAcquired": 1,
             "acquirerCompany": description_acquirer,
             "source": "description",
             "matchedPattern": description_match["matchedPattern"],
-            "confidenceScore": description_match.get("confidenceScore"),
+            "confidenceScore": score,
         }
 
     # Both paths found a candidate - compare them.
@@ -151,6 +173,9 @@ def _combine_results(name_match: dict[str, Any] | None, description_match: dict[
         # kept simple here since this script's own priority rules already
         # differ from that module's - see the module docstring).
         confidence_score = max(name_score, description_score)
+        notes = name_match.get("confidence_notes") if matched_pattern == "structured_field" else None
+        if raw is not None:
+            confidence_score, _ = _apply_structured_field_confidence_boost(confidence_score, notes, raw)
         return {
             "isAcquired": 1,
             "acquirerCompany": acquirer,
@@ -181,6 +206,9 @@ def _combine_results(name_match: dict[str, Any] | None, description_match: dict[
         description_acquirer,
         primary_acquirer,
     )
+    if raw is not None:
+        primary_notes = name_match.get("confidence_notes") if primary_pattern == "structured_field" else None
+        primary_score, _ = _apply_structured_field_confidence_boost(primary_score, primary_notes, raw)
     return {
         "isAcquired": 1,
         "acquirerCompany": primary_acquirer,
@@ -209,7 +237,7 @@ def process_company(dwh_id: str, data_source: CompanyDataSource) -> dict[str, An
 
         name_match = check_company_record(record)
         description_match = extract_acquirer_from_description(record.raw.get("description"))
-        combined = _combine_results(name_match, description_match)
+        combined = _combine_results(name_match, description_match, record.raw)
 
         return {
             "dwhId": dwh_id,

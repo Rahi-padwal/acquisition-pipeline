@@ -11,7 +11,7 @@ from __future__ import annotations
 import os
 import time
 from dataclasses import dataclass, field
-from typing import Protocol
+from typing import Any, Protocol
 
 import requests
 import urllib3
@@ -28,6 +28,66 @@ class CompanyRecord:
     company_id: str
     company_name: str
     raw: dict = field(default_factory=dict)
+
+
+# Text fields detection code assumes are a plain string or None. ES has been
+# observed to occasionally return one of these as a list instead - e.g. a
+# company literally named "[0]" came back as companyName: [0] (a list
+# containing the int 0, not the string "[0]") for dwhId
+# 25fd89d933a265f227e103e161e17095. Left un-normalized, this crashes
+# find_acquirer_in_name()'s `.strip()` and _acquirer_corroborated_in_own_text()'s
+# `.lower()` in check_name_signals.py, and crashes a SQLite insert further
+# downstream in any pipeline that writes these fields to a TEXT column.
+_LIST_SHAPED_TEXT_FIELDS = ("companyName", "description", "linkedinProfileName")
+
+# Same surprise, one level deeper: fundingAndInvestment.acquiredBy.{acquirerCompanyName,
+# acquireeCompanyName} get `.strip()`'d directly in check_name_signals.py's
+# _check_structured_fields() - confirmed by testing a synthetic record shaped
+# like the same real document above, with acquireeCompanyName as a list.
+_LIST_SHAPED_ACQUIRED_BY_FIELDS = ("acquirerCompanyName", "acquireeCompanyName")
+
+
+def _normalize_text_field(value: Any) -> Any:
+    """Pass through anything that isn't a list. For a list, join whatever
+    non-null elements it has into one string (str()'d individually, since an
+    element can be a non-string like a bare int) - this covers both a stray
+    single-element list and a genuine multi-value field without guessing
+    which one it is. An empty/all-null list normalizes to None."""
+    if not isinstance(value, list):
+        return value
+    parts = [str(item) for item in value if item is not None and str(item).strip()]
+    return " ".join(parts) if parts else None
+
+
+def normalize_company_source(source: dict[str, Any]) -> dict[str, Any]:
+    """Normalize known list-shaped-field surprises in a raw ES `_source`
+    dict, in place, before it's used to build a CompanyRecord. This is the
+    one place this happens - downstream detection functions (in
+    check_name_signals.py, description_detection_api.py) are NOT patched
+    individually to defend against this; they can keep assuming a plain
+    string/None as documented."""
+    for field_name in _LIST_SHAPED_TEXT_FIELDS:
+        if field_name in source:
+            source[field_name] = _normalize_text_field(source[field_name])
+
+    # Mirrors the same list-vs-dict unwrapping check_name_signals.py's own
+    # _check_structured_fields()/_check_funding_milestones() already do for
+    # acquiredBy - mutating the same nested dict object in place here means
+    # those functions see the normalized value when they independently
+    # re-read raw["fundingAndInvestment"]["acquiredBy"] later.
+    funding = source.get("fundingAndInvestment")
+    if isinstance(funding, list):
+        funding = funding[0] if funding else None
+    if isinstance(funding, dict):
+        acquired_by = funding.get("acquiredBy")
+        if isinstance(acquired_by, list):
+            acquired_by = acquired_by[0] if acquired_by else None
+        if isinstance(acquired_by, dict):
+            for field_name in _LIST_SHAPED_ACQUIRED_BY_FIELDS:
+                if field_name in acquired_by:
+                    acquired_by[field_name] = _normalize_text_field(acquired_by[field_name])
+
+    return source
 
 
 class CompanyDataSource(Protocol):
@@ -111,7 +171,7 @@ class ElasticCompanyDataSource:
 
     @staticmethod
     def _to_record(hit: dict) -> CompanyRecord:
-        source = hit.get("_source", {})
+        source = normalize_company_source(hit.get("_source", {}))
         # .get(key, default) ignores `default` when the key exists but is null.
         company_id = source.get("companyId")
         if company_id is None:
