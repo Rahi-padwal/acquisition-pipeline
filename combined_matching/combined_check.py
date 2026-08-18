@@ -279,8 +279,17 @@ def run_combined_check(dwh_id: str, data_source: CompanyDataSource) -> dict:
 
         # Final post-processing step, applied after every score/notes
         # computation above - see _apply_structured_field_confidence_boost()'s
-        # docstring.
-        score, notes = _apply_structured_field_confidence_boost(score, notes, record.raw)
+        # docstring. Skipped when the match ITSELF is structured_field: in
+        # that case "is the structured field populated?" is tautologically
+        # always true (that's literally the data that produced this match),
+        # so calling the boost here is circular and does nothing but log a
+        # meaningless "conflict" warning on every single uncorroborated
+        # structured_field row in the dataset. The boost is only meaningful
+        # as EXTRA corroboration for a match that came from a different
+        # source (powered_by, joined_forces, description) and happens to
+        # also have a populated structured field.
+        if name_match["matched_pattern"] != "structured_field":
+            score, notes = _apply_structured_field_confidence_boost(score, notes, record.raw)
 
         return _positive_result(
             record,

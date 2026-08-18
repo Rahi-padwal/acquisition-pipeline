@@ -137,7 +137,13 @@ def _combine_results(
         # check_name_signals._score_match), so it's the only notes value the
         # boost step needs to know about here.
         notes = name_match.get("confidence_notes") if matched_pattern == "structured_field" else None
-        if raw is not None:
+        # Skipped when the match itself IS structured_field - see the
+        # matching guard/comment in combined_check.py's run_combined_check().
+        # Boosting a structured_field match using the structured field is
+        # circular (the field being "populated" is guaranteed by definition
+        # here) and was spamming a meaningless warning on every uncorroborated
+        # structured_field row in a full-batch run.
+        if raw is not None and matched_pattern != "structured_field":
             score, _ = _apply_structured_field_confidence_boost(score, notes, raw)
         return {
             "isAcquired": 1,
@@ -174,7 +180,7 @@ def _combine_results(
         # differ from that module's - see the module docstring).
         confidence_score = max(name_score, description_score)
         notes = name_match.get("confidence_notes") if matched_pattern == "structured_field" else None
-        if raw is not None:
+        if raw is not None and matched_pattern != "structured_field":
             confidence_score, _ = _apply_structured_field_confidence_boost(confidence_score, notes, raw)
         return {
             "isAcquired": 1,
@@ -206,9 +212,10 @@ def _combine_results(
         description_acquirer,
         primary_acquirer,
     )
-    if raw is not None:
-        primary_notes = name_match.get("confidence_notes") if primary_pattern == "structured_field" else None
-        primary_score, _ = _apply_structured_field_confidence_boost(primary_score, primary_notes, raw)
+    if raw is not None and primary_pattern != "structured_field":
+        # primary_pattern != "structured_field" here (guarded above), so
+        # there's no structured_field_uncorroborated note to pass through.
+        primary_score, _ = _apply_structured_field_confidence_boost(primary_score, None, raw)
     return {
         "isAcquired": 1,
         "acquirerCompany": primary_acquirer,
