@@ -7,6 +7,23 @@ from data_source import CompanyDataSource, CompanyRecord
 # Capital letter + up to 50 more name-shaped chars.
 _NAME_CAPTURE = r"[A-Z][\w&.,' -]{1,50}?"
 
+# Stricter variant used only by powered_by/joined_forces_with/self_by_acquirer
+# (the same three riskiest patterns already gated by _FILTERED_PATTERNS
+# below). _NAME_CAPTURE's char class allows embedded periods/commas with no
+# stopping point short of end-of-string, which is exactly what let a case
+# like "TBWA Indonesia - Powered by AI. Driven by Disruption for Digital
+# Growth." swallow the ENTIRE marketing tagline as the "acquirer" (nothing
+# in the string was forbidden, so the capture had no reason to stop short of
+# the end). This variant forbids crossing a ".", "," ";" or ":" that's
+# followed by whitespace - a sentence/clause boundary - while still allowing
+# the same punctuation when it's NOT followed by whitespace, so compact
+# tokens like "Salary.com" or a trailing abbreviation like "Co." (period at
+# the very end, nothing after it) still capture correctly. When a genuine
+# acquirer name is followed by leftover prose, the pattern now simply fails
+# to match at all (falls through to no match) instead of matching with a
+# truncated or wrong acquirer.
+_RISKY_ACQUIRER_CAPTURE = r"[A-Z](?:(?!\.\s|,\s|;\s|:\s)[\w&.,' -]){0,49}?"
+
 # (name, pattern). Anchored end-to-end - the whole field is matched, not a
 # sentence in a document. (?i:...) scopes case-insensitivity to keywords only,
 # so the acquirer's [A-Z] anchor still requires a real capital letter.
@@ -55,7 +72,7 @@ _NAME_ACQUIRER_PATTERNS = [
         "joined_forces_with",
         re.compile(
             r"^(?P<self>.+?),?\s+(?i:(?:has\s+)?joined\s+forces\s+with)\s+"
-            r"(?P<acquirer>" + _NAME_CAPTURE + r")\)?\s*$"
+            r"(?P<acquirer>" + _RISKY_ACQUIRER_CAPTURE + r")\)?\s*$"
         ),
     ),
     (
@@ -68,7 +85,7 @@ _NAME_ACQUIRER_PATTERNS = [
     (
         "powered_by",
         re.compile(
-            r"^(?P<self>.+?),?\s+(?i:powered\s+by)\s+(?P<acquirer>" + _NAME_CAPTURE + r")\)?\s*$"
+            r"^(?P<self>.+?),?\s+(?i:powered\s+by)\s+(?P<acquirer>" + _RISKY_ACQUIRER_CAPTURE + r")\)?\s*$"
         ),
     ),
     (
@@ -102,7 +119,7 @@ _NAME_ACQUIRER_PATTERNS = [
         # "Nest by Google" - riskier, "by" is common outside acquisitions too.
         "self_by_acquirer",
         re.compile(
-            r"^(?P<self>.+?),?\s+(?i:by)\s+(?P<acquirer>" + _NAME_CAPTURE + r")\)?\s*$"
+            r"^(?P<self>.+?),?\s+(?i:by)\s+(?P<acquirer>" + _RISKY_ACQUIRER_CAPTURE + r")\)?\s*$"
         ),
     ),
 ]
@@ -195,6 +212,120 @@ def _is_valid_acquirer_candidate(candidate: str, self_name: str) -> bool:
     return True
 
 
+# --- powered_by / joined_forces_with-specific quality filters ----------------
+#
+# These two patterns are the weakest, riskiest triggers in _NAME_ACQUIRER_PATTERNS
+# (see their 0.7 base confidence below) - "X powered by Y" and "X joined forces
+# with Y" both use ambiguous everyday phrasing that shows up for reasons other
+# than "Y acquired X": franchise/reseller-network branding, accelerator/grant
+# relationships, and prose the capture over-grabbed instead of isolating a
+# real company name. Manual review of ~40 real matches turned up two
+# recurring, nameable failure categories - see the two checks below. Neither
+# adjusts confidence score; a match that trips either filter is discarded
+# entirely (not returned), same as a self-truncation rejection.
+#
+# Deliberately scoped to ONLY these two patterns via the pattern_name check at
+# each call site - was_acquired_by, subsidiary_of, acquired_by, etc. are much
+# more explicit/unambiguous phrasing and should not be filtered by this logic.
+
+# "Proforma" is a promotional-products franchise brand: independent local
+# franchisees caption their sites "powered by Proforma <Franchisee Name>",
+# which reads exactly like an acquisition but isn't one - matched as a
+# prefix, not just the bare word, since the captured acquirer is routinely
+# "Proforma Albrecht & Co." / "Proforma <whoever>", not literally "Proforma"
+# alone. AXI was investigated and rejected for this list - see
+# combined_matching conversation history: AXI's own press release names
+# InterIT, IT Provider and DVIT as genuine acquisitions (all three brands of
+# ITP Group), not franchisees, so it stays out.
+_NON_ACQUIRER_ORG_PREFIXES = ("proforma",)
+
+# Accelerators, grant programs and investment funds back/support companies;
+# they don't acquire them. Matched as a standalone word (not substring) so
+# this doesn't reject a real company name that merely contains one of these
+# as a word-fragment (e.g. "Idealab" is untouched; "NC IDEA" is caught).
+_ACCELERATOR_FUND_RE = re.compile(r"\b(accelerators?|akcelerator|funds?|idea)\b", re.IGNORECASE)
+
+
+def _is_non_acquirer_organization(candidate: str) -> bool:
+    """True when `candidate` names a known category of non-acquirer
+    organization (franchise network, accelerator, fund) rather than a real
+    acquirer - see the constants above."""
+    normalized = candidate.strip().lower()
+    if any(normalized == prefix or normalized.startswith(prefix + " ") for prefix in _NON_ACQUIRER_ORG_PREFIXES):
+        return True
+    return bool(_ACCELERATOR_FUND_RE.search(candidate))
+
+
+# Sentence-filler words that show up when the regex over-captured surrounding
+# prose instead of isolating a company name - "joined forces with leading
+# health care providers and major U.S. ..." being the motivating case.
+_ACQUIRER_FILLER_PHRASE_RE = re.compile(
+    r"\b(?:leading|major|other|various|several|top|well[\s-]known|renowned|trusted)\b|\b(?:like|such\s+as|including)\b",
+    re.IGNORECASE,
+)
+
+# Generic/tagline words that read as descriptive terms rather than a company
+# name when that's ALL the capitalized content in a capture amounts to (e.g.
+# "AI Growth", "Application Verification"). Deliberately a separate set from
+# _GENERIC_TERM_DENYLIST above (which is shared by every pattern) - this one
+# only feeds _is_garbage_acquirer_text() and only for powered_by/
+# joined_forces_with, so widening it can't affect any other pattern's scoring.
+_POWERED_BY_JOINED_FORCES_GENERIC_WORDS = {
+    "ai", "growth", "application", "applications", "verification",
+    "solution", "solutions", "platform", "platforms", "software",
+    "technology", "technologies", "digital", "data", "analytics",
+    "insights", "innovation", "innovations", "systems", "system",
+    "service", "services", "cloud", "network", "networks",
+}
+
+
+def _is_garbage_acquirer_text(candidate: str) -> bool:
+    """True when `candidate` looks like over-captured prose rather than a
+    company name: either it contains a sentence-filler word/phrase, or none
+    of its capitalized-looking words are anything but generic tagline terms
+    (so there's no actual proper-noun-shaped content at all)."""
+    if _ACQUIRER_FILLER_PHRASE_RE.search(candidate):
+        return True
+
+    capitalized_words = [w.strip(".,'-&") for w in candidate.split() if w[:1].isupper()]
+    capitalized_words = [w for w in capitalized_words if w]
+    if not capitalized_words:
+        return True
+    return all(w.lower() in _POWERED_BY_JOINED_FORCES_GENERIC_WORDS for w in capitalized_words)
+
+
+# self_by_acquirer ("X by Y") gets both guards above (it's exactly as
+# ambiguous a trigger as powered_by/joined_forces_with - the code's own
+# comment on the pattern already calls it out as riskier) PLUS one more,
+# below: "X by Y" also fires on "Product by its own Developer" branding
+# (e.g. "NimbleS2P by Techpanion", "MPO Solution by Ngenio") where Y built
+# and owns X from the start - never acquired anything - which the acquirer-
+# side checks above can't catch since the acquirer name itself (Techpanion,
+# Ngenio) is a perfectly real, non-generic company name. The signal here is
+# on the SELF side instead: a self_name containing a product/tool-shaped
+# word is a tell that "self" names a product, not the acquired company.
+#
+# Known limitation, accepted rather than chased: this only catches
+# space-separated product words ("MPO Solution" -> catches "Solution").
+# A compound, no-space brand like "NimbleS2P" has no word boundary around
+# the embedded "S2P" for this check to find, so that shape still gets
+# through - a camelCase/acronym splitter to close that gap was considered
+# and skipped as not worth the fragility it would add.
+_PRODUCT_LIKE_SELF_WORDS = {
+    "solution", "solutions", "platform", "platforms", "suite", "system",
+    "systems", "software", "app", "apps", "tool", "tools", "module",
+    "engine", "portal", "dashboard",
+}
+
+
+def _is_product_like_self_name(self_name: str) -> bool:
+    words = [w.strip(".,()'\"-").lower() for w in self_name.split()]
+    return any(w in _PRODUCT_LIKE_SELF_WORDS for w in words if w)
+
+
+_FILTERED_PATTERNS = {"powered_by", "joined_forces_with", "self_by_acquirer"}
+
+
 def _is_self_truncation(candidate: str, self_name: str) -> bool:
     """True when `candidate` is just `self_name` with a short trailing
     suffix/acronym chopped off (e.g. candidate "Moore" vs self name
@@ -239,7 +370,16 @@ _PATTERN_BASE_CONFIDENCE: dict[str, float] = {
     "a_company_of": 0.9,                # "a company of X" - reverse of a_x_company, same family
     "a_x_brand": 0.9,                   # "a X brand" - same family as a_x_company
     "trading_as": 0.9,                  # "X, trading as Company"
-    "self_by_acquirer": 0.9,            # "Company by X"
+    # "Company by X" - demoted from 0.9 after manual review found 7/9 sampled
+    # matches were false positives (X is the product's own creator/developer,
+    # not an acquirer - e.g. "CoLumbo by Smart Soft Healthcare", "BeTalent by
+    # Zircon"). That's a real-world fact ("did Y buy X, or did Y build X?"),
+    # not a text-shape signal a regex can resolve on its own, so - unlike
+    # powered_by/joined_forces_with above - this isn't a case a garbage-text
+    # filter can fix; the low score instead lets combined_check.py's cross-
+    # source corroboration logic do the real work (bump back up when
+    # structured_field/description independently agree, stay low otherwise).
+    "self_by_acquirer": 0.3,
     "powered_by": 0.7,                  # "powered by X" - weakest explicit regex pattern
     "structured_field": 1.0,            # ES's own isAcquired/acquiredBy fields; see modifier below
     "funding_round_parenthetical": 0.7,  # "(part of X)" scraped from a funding-round label
@@ -303,6 +443,20 @@ def find_acquirer_in_name(company_name: str) -> dict | None:
         self_name = match.group("self").strip()
         if not _is_valid_acquirer_candidate(acquirer, self_name):
             continue
+        if pattern_name in _FILTERED_PATTERNS and (
+            _is_non_acquirer_organization(acquirer) or _is_garbage_acquirer_text(acquirer)
+        ):
+            # `return None`, not `continue`: self_by_acquirer ("X by Y") is a
+            # later, looser fallback in this same pattern list, and "powered
+            # by X" / "joined forces with X" text always ALSO matches "X by
+            # Y" - falling through would just let self_by_acquirer re-catch
+            # the exact text this filter just rejected. Other detectors
+            # (structured_field, funding-round parenthetical, description-
+            # based) are untouched and still run separately in
+            # check_company_record().
+            return None
+        if pattern_name == "self_by_acquirer" and _is_product_like_self_name(self_name):
+            return None
 
         return {
             "candidate_name": acquirer,

@@ -122,22 +122,76 @@ def _is_joined_forces_list_announcement(text: str, match: re.Match) -> bool:
 
     tail = text[match.end("acquirer") : match.end("acquirer") + 60]
     return bool(_JOINED_FORCES_MULTI_ENTITY_TAIL.match(tail))
+
+
+# --- joined_forces-specific non-acquirer / garbage-text filters --------------
+#
+# Manual review of ~40 real powered_by/joined_forces matches (name_matching
+# side and this description side together) turned up two more recurring
+# false-positive categories beyond the list-announcement shape above:
+# franchise-network/accelerator-fund organizations getting read as an
+# acquirer, and captures that are just over-grabbed prose with no real
+# company name in them. Mirrors name_matching/check_name_signals.py's
+# _is_non_acquirer_organization()/_is_garbage_acquirer_text() - duplicated
+# rather than imported since this module is intentionally standalone (own
+# FastAPI app, own ES client - see the module docstring), and only applied to
+# joined_forces here (this module has no powered_by pattern of its own).
+_NON_ACQUIRER_ORG_PREFIXES = ("proforma",)
+_ACCELERATOR_FUND_RE = re.compile(r"\b(accelerators?|akcelerator|funds?|idea)\b", re.IGNORECASE)
+
+
+def _is_non_acquirer_organization(candidate: str) -> bool:
+    normalized = candidate.strip().lower()
+    if any(normalized == prefix or normalized.startswith(prefix + " ") for prefix in _NON_ACQUIRER_ORG_PREFIXES):
+        return True
+    return bool(_ACCELERATOR_FUND_RE.search(candidate))
+
+
+_ACQUIRER_FILLER_PHRASE_RE = re.compile(
+    r"\b(?:leading|major|other|various|several|top|well[\s-]known|renowned|trusted)\b|\b(?:like|such\s+as|including)\b",
+    re.IGNORECASE,
+)
+_POWERED_BY_JOINED_FORCES_GENERIC_WORDS = {
+    "ai", "growth", "application", "applications", "verification",
+    "solution", "solutions", "platform", "platforms", "software",
+    "technology", "technologies", "digital", "data", "analytics",
+    "insights", "innovation", "innovations", "systems", "system",
+    "service", "services", "cloud", "network", "networks",
+}
+
+
+def _is_garbage_acquirer_text(candidate: str) -> bool:
+    if _ACQUIRER_FILLER_PHRASE_RE.search(candidate):
+        return True
+    capitalized_words = [w.strip(".,'-&") for w in candidate.split() if w[:1].isupper()]
+    capitalized_words = [w for w in capitalized_words if w]
+    if not capitalized_words:
+        return True
+    return all(w.lower() in _POWERED_BY_JOINED_FORCES_GENERIC_WORDS for w in capitalized_words)
+
+
 _FORMERLY = re.compile(
     r"\bformerly\s+(?:known\s+as\s+)?(?P<acquirer>" + _NAME_CAPTURE + r")" + _NAME_TERMINATOR,
     re.IGNORECASE,
 )
-_STAY_UP_TO_DATE = re.compile(
-    r"to\s+stay\s+up\s+to\s+date\s+on\s+(?P<acquirer>" + _NAME_CAPTURE + r")" + _NAME_TERMINATOR,
-    re.IGNORECASE,
-)
-# "X is now Y" / "X are now Y" - primary, high-confidence trigger (same tier
-# as was_acquired_by). Added because the real acquisition signal is often
-# stated this way rather than via "formerly" - e.g. "Emburse Go (formerly
-# Roadmap) is now Emburse." - the acquirer here is "Emburse", not "Roadmap".
-_IS_NOW = re.compile(
-    r"\b(?:is|are)\s+now\s+(?P<acquirer>" + _NAME_CAPTURE + r")" + _NAME_TERMINATOR,
-    re.IGNORECASE,
-)
+# Removed: "to stay up to date on X" (matched_pattern "stay_up_to_date") used
+# to live here, scored 0.5. Pulled entirely after manual review found it was
+# 100% false positive across every sample checked - 5/5 across two separate
+# verification passes, with zero true positives observed. Unlike is_now
+# (which had a real minority of genuine catches worth weighing against the
+# noise), this pattern had nothing to trade off, so it's a straight removal
+# rather than a confidence demotion.
+#
+# Removed: "X is now Y" / "X are now Y" (matched_pattern "is_now") used to
+# live here, scored at the top confidence tier (1.0) alongside was_acquired_by.
+# Pulled entirely after auditing all 2,316 is_now rows in
+# combined_matching/acquired_companies.csv: ~87% were garbage-text captures
+# ("is now available", "is now closed", "is now co-owned by Sonny and their
+# partner" - sentence continuations, not company names), the worst false-
+# positive rate of any pattern in the pipeline despite carrying its highest
+# confidence score. A minority of genuine catches (e.g. "Network for Good is
+# now Bonterra") are lost with it; some of those may still surface via the
+# formerly fallback below at lower confidence, but not all will.
 
 # Bare "formerly" count, used by the consolidator heuristic below - doesn't
 # need a capture group, just a count of occurrences.
@@ -160,9 +214,7 @@ _DESCRIPTION_PATTERNS: list[tuple[str, re.Pattern]] = [
     ("was_acquired_by", _WAS_ACQUIRED_BY),
     ("wholly_owned_subsidiary", _WHOLLY_OWNED_SUBSIDIARY),
     ("joined_forces", _JOINED_FORCES),
-    ("is_now", _IS_NOW),
     ("formerly", _FORMERLY),
-    ("stay_up_to_date", _STAY_UP_TO_DATE),
 ]
 
 
@@ -186,9 +238,7 @@ def _clean_acquirer(raw: str) -> str:
 _PATTERN_BASE_CONFIDENCE: dict[str, float] = {
     "was_acquired_by": 1.0,
     "wholly_owned_subsidiary": 1.0,
-    "is_now": 1.0,
     "joined_forces": 0.7,
-    "stay_up_to_date": 0.5,
     "formerly": 0.3,
 }
 
@@ -201,8 +251,8 @@ def extract_acquirer_from_description(description: str | None) -> dict[str, Any]
     """Scan `description` for acquisition-indicating phrases.
 
     Tries patterns in priority order: was_acquired_by > wholly_owned_subsidiary
-    > joined_forces > is_now > formerly (supporting-only, see below) >
-    stay_up_to_date. Returns None if there's no description or nothing
+    > joined_forces > formerly (supporting-only, see below). Returns None if
+    there's no description or nothing
     matches, otherwise:
         {"acquirerCompany": str | None, "matchedPattern": str,
          "confidence": "high" | "low", "nameChanged": bool,
@@ -252,14 +302,18 @@ def extract_acquirer_from_description(description: str | None) -> dict[str, Any]
         ("was_acquired_by", _WAS_ACQUIRED_BY),
         ("wholly_owned_subsidiary", _WHOLLY_OWNED_SUBSIDIARY),
         ("joined_forces", _JOINED_FORCES),
-        ("is_now", _IS_NOW),
     ):
         m = pattern.search(text)
-        if m and pattern_name == "joined_forces" and _is_joined_forces_list_announcement(text, m):
-            # Partnership/client-list announcement, not an acquisition - see
-            # _is_joined_forces_list_announcement(). Discard entirely (don't
-            # score, don't return) rather than picking one name out of the
-            # list; the remaining patterns below still get a chance to match.
+        if m and pattern_name == "joined_forces" and (
+            _is_joined_forces_list_announcement(text, m)
+            or _is_non_acquirer_organization(m.group("acquirer"))
+            or _is_garbage_acquirer_text(m.group("acquirer"))
+        ):
+            # Partnership/client-list announcement, known non-acquirer org
+            # (franchise network/accelerator/fund), or over-captured prose -
+            # not a confident single acquirer either way. Discard entirely
+            # (don't score, don't return) rather than picking one name out;
+            # the remaining patterns below still get a chance to match.
             m = None
         if m:
             return {
@@ -290,18 +344,6 @@ def extract_acquirer_from_description(description: str | None) -> dict[str, Any]
             "nameChanged": True,
             "isLikelyAcquirer": False,
             "rawText": formerly_match.group(0),
-        }
-
-    stay_up_to_date_match = _STAY_UP_TO_DATE.search(text)
-    if stay_up_to_date_match:
-        return {
-            "acquirerCompany": _clean_acquirer(stay_up_to_date_match.group("acquirer")),
-            "matchedPattern": "stay_up_to_date",
-            "confidence": "low",
-            "confidenceScore": _base_confidence_for_pattern("stay_up_to_date"),
-            "nameChanged": False,
-            "isLikelyAcquirer": False,
-            "rawText": stay_up_to_date_match.group(0),
         }
 
     return None
