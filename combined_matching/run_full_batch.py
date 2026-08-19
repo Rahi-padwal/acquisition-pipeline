@@ -190,6 +190,7 @@ def process_company(source: dict[str, Any]) -> dict[str, Any]:
             "source": None,
             "matchedPattern": None,
             "confidenceScore": None,
+            "reviewStatus": None,
         }
 
 
@@ -215,10 +216,19 @@ def _create_table(conn: sqlite3.Connection) -> None:
             acquirerCompany TEXT,
             source TEXT,
             matchedPattern TEXT,
-            confidenceScore REAL
+            confidenceScore REAL,
+            reviewStatus TEXT
         )
         """
     )
+
+    # combined_acquisitions_full.db already exists from the first full run,
+    # written before reviewStatus existed - CREATE TABLE IF NOT EXISTS above
+    # is a no-op against that file, so the column has to be added here too.
+    existing_columns = {row[1] for row in conn.execute("PRAGMA table_info(combined_acquisitions)")}
+    if "reviewStatus" not in existing_columns:
+        conn.execute("ALTER TABLE combined_acquisitions ADD COLUMN reviewStatus TEXT")
+
     conn.commit()
 
 
@@ -248,8 +258,8 @@ def run_batch(es: Elasticsearch, conn: sqlite3.Connection) -> None:
             try:
                 conn.execute(
                     "INSERT OR REPLACE INTO combined_acquisitions "
-                    "(dwhId, companyName, isAcquired, acquirerCompany, source, matchedPattern, confidenceScore) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    "(dwhId, companyName, isAcquired, acquirerCompany, source, matchedPattern, confidenceScore, reviewStatus) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         dwh_id_value,
                         _to_sqlite_value(row.get("companyName")),
@@ -258,6 +268,7 @@ def run_batch(es: Elasticsearch, conn: sqlite3.Connection) -> None:
                         _to_sqlite_value(row.get("source")),
                         _to_sqlite_value(row.get("matchedPattern")),
                         _to_sqlite_value(row.get("confidenceScore")),
+                        _to_sqlite_value(row.get("reviewStatus")),
                     ),
                 )
             except Exception:
@@ -268,8 +279,8 @@ def run_batch(es: Elasticsearch, conn: sqlite3.Connection) -> None:
                 logger.exception("dwhId %s: failed to write to SQLite even after coercion", dwh_id_value)
                 conn.execute(
                     "INSERT OR REPLACE INTO combined_acquisitions "
-                    "(dwhId, companyName, isAcquired, acquirerCompany, source, matchedPattern, confidenceScore) "
-                    "VALUES (?, NULL, NULL, NULL, NULL, NULL, NULL)",
+                    "(dwhId, companyName, isAcquired, acquirerCompany, source, matchedPattern, confidenceScore, reviewStatus) "
+                    "VALUES (?, NULL, NULL, NULL, NULL, NULL, NULL, NULL)",
                     (dwh_id_value,),
                 )
         conn.commit()
@@ -289,8 +300,14 @@ def run_batch(es: Elasticsearch, conn: sqlite3.Connection) -> None:
     logger.info("Done. Processed %d companies total in %.1fs.", processed, elapsed)
 
     acquired = conn.execute("SELECT COUNT(*) FROM combined_acquisitions WHERE isAcquired = 1").fetchone()[0]
+    likely_acquired = conn.execute(
+        "SELECT COUNT(*) FROM combined_acquisitions WHERE reviewStatus = 'likely_acquired'"
+    ).fetchone()[0]
     errors = conn.execute("SELECT COUNT(*) FROM combined_acquisitions WHERE isAcquired IS NULL").fetchone()[0]
-    logger.info("acquired=%d not_acquired=%d errors=%d", acquired, processed - acquired - errors, errors)
+    not_acquired = processed - acquired - likely_acquired - errors
+    logger.info(
+        "acquired=%d likely_acquired=%d not_acquired=%d errors=%d", acquired, likely_acquired, not_acquired, errors
+    )
 
 
 def main() -> None:

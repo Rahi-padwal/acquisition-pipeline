@@ -32,8 +32,10 @@ for _subdir in ("name_matching", "description_matching"):
         sys.path.insert(0, _path)
 
 from check_name_signals import _company_identity_match, check_company_record  # noqa: E402 (from name_matching)
+from check_name_signals import _PATTERN_BASE_CONFIDENCE as _NAME_PATTERN_BASE_CONFIDENCE  # noqa: E402
 from data_source import CompanyDataSource, CompanyRecord, ElasticCompanyDataSource  # noqa: E402 (from name_matching)
 from description_detection_api import extract_acquirer_from_description  # noqa: E402 (from description_matching)
+from description_detection_api import _PATTERN_BASE_CONFIDENCE as _DESCRIPTION_PATTERN_BASE_CONFIDENCE  # noqa: E402
 
 # check_company_record() actually runs three distinct detectors in sequence
 # (see its docstring) and tags each match with which one fired via
@@ -67,21 +69,45 @@ def _source_for_name_match(matched_pattern: str) -> str:
 _CORROBORATION_BONUS = 0.05
 _CORROBORATION_CAP = 0.98
 _CONFLICT_CAP = 0.4
+# A cross-source conflict shouldn't discount every pattern equally - a
+# well-proven pattern (part_of, division_of, structured_field, a_x_company,
+# ... - tested close to 100% reliable this session) disagreeing with a weak
+# description-side guess is a different situation than a shaky pattern
+# (self_by_acquirer, powered_by - tested ~25-28% true) disagreeing. High-
+# trust patterns get the softer cap below instead of the full _CONFLICT_CAP.
+_HIGH_TRUST_CONFLICT_CAP = 0.7
+_HIGH_TRUST_MIN_BASE_SCORE = 0.9
+
+
+def _is_high_trust_pattern(matched_pattern: str) -> bool:
+    """High-trust = the pattern's own base score (in check_name_signals.py's
+    or description_detection_api.py's _PATTERN_BASE_CONFIDENCE - whichever
+    module the pattern belongs to) is 0.9 or higher. Reuses those tables
+    directly rather than keeping a separate duplicate list in sync."""
+    base = _NAME_PATTERN_BASE_CONFIDENCE.get(matched_pattern, _DESCRIPTION_PATTERN_BASE_CONFIDENCE.get(matched_pattern))
+    return base is not None and base >= _HIGH_TRUST_MIN_BASE_SCORE
+
+
+def _conflict_capped_score(score: float, matched_pattern: str) -> float:
+    """Score cap for a cross-source conflict (both detectors fired and
+    disagreed) - see _is_high_trust_pattern() for which cap applies."""
+    cap = _HIGH_TRUST_CONFLICT_CAP if _is_high_trust_pattern(matched_pattern) else _CONFLICT_CAP
+    return min(score, cap)
 
 
 def _apply_cross_source_modifiers(
-    primary_acquirer: str, primary_score: float, other_acquirer: str | None
+    primary_acquirer: str, primary_score: float, other_acquirer: str | None, primary_pattern: str
 ) -> tuple[float, str | None]:
     """Adjust `primary_score` given the OTHER source's candidate (or None if
-    it didn't find one). `primary_acquirer`/`primary_score` belong to
-    whichever source wins as likely_acquirer (name-based takes priority when
-    both fire - unchanged from before this scoring work). Returns
-    (adjusted_score, confidence_notes)."""
+    it didn't find one). `primary_acquirer`/`primary_score`/`primary_pattern`
+    belong to whichever source wins as likely_acquirer (name-based takes
+    priority when both fire - unchanged from before this scoring work).
+    Returns (adjusted_score, confidence_notes)."""
     if other_acquirer is None:
         return primary_score, None
     if _company_identity_match(primary_acquirer, other_acquirer):
         return min(_CORROBORATION_CAP, primary_score + _CORROBORATION_BONUS), "corroborated_by_both_sources"
-    return min(primary_score, _CONFLICT_CAP), "source_conflict"
+    return _conflict_capped_score(primary_score, primary_pattern), "source_conflict"
 
 
 # --- Post-hoc structured-field confidence boost ------------------------------
@@ -171,11 +197,48 @@ def _apply_structured_field_confidence_boost(
     return score, notes
 
 
+# --- Review-bucket classification --------------------------------------------
+#
+# isAcquired alone can't tell a confidently-detected acquisition apart from
+# a low-confidence one that merely matched SOME pattern - both used to come
+# back as isAcquired=1. Manual web-search verification against the full
+# 6,480-row batch output (~30 self_by_acquirer rows sampled by hand) found
+# self_by_acquirer - the only pattern that ever scores exactly 0.3 - wrong
+# roughly 3 times out of 4 when uncorroborated (genuine hits get lifted
+# above this floor already, by the corroboration bonus or the structured-
+# field boost above, so what's LEFT sitting at exactly 0.3 is
+# disproportionately noise). Rather than silently folding those rows into
+# isAcquired=0 (indistinguishable there from a company with no acquisition
+# evidence at all), they get their own bucket so a human can still review
+# them instead of the data just dropping them.
+_REVIEW_FLOOR = 0.3
+
+STATUS_ACQUIRED = "acquired"
+# Labeled "likely_acquired" (not "needs_review") per explicit product
+# decision - even though the ~25-28% true rate we measured argues the
+# opposite of what "likely" suggests, that's the wording asked for.
+STATUS_LIKELY_ACQUIRED = "likely_acquired"
+STATUS_NOT_ACQUIRED = "not_acquired"
+
+
+def classify_review_status(score: float | None) -> tuple[int, str]:
+    """(isAcquired, reviewStatus) for a row's FINAL confidence_score. Call
+    this LAST, after every other adjustment (corroboration bonus/cap,
+    structured-field boost) - those can move a score across the floor, so
+    calling this any earlier would classify against a stale number."""
+    if score is None:
+        return 0, STATUS_NOT_ACQUIRED
+    if score <= _REVIEW_FLOOR:
+        return 0, STATUS_LIKELY_ACQUIRED
+    return 1, STATUS_ACQUIRED
+
+
 def _not_found_result(dwh_id: str) -> dict:
     return {
         "company_id": None,
         "company_name": dwh_id,
         "is_acquired": False,
+        "review_status": STATUS_NOT_ACQUIRED,
         "likely_acquirer": None,
         "source": None,
         "confidence_score": None,
@@ -189,6 +252,7 @@ def _not_acquired_result(record: CompanyRecord) -> dict:
         "company_id": record.company_id,
         "company_name": record.company_name,
         "is_acquired": False,
+        "review_status": STATUS_NOT_ACQUIRED,
         "likely_acquirer": None,
         "source": None,
         "confidence_score": None,
@@ -217,10 +281,14 @@ def _positive_result(
     if extra_evidence:
         evidence.extend(extra_evidence)
 
+    # Same floor as the batch pipeline (test_combined_pipeline.py) - a match
+    # isn't automatically is_acquired=True anymore, see classify_review_status().
+    is_acquired, review_status = classify_review_status(confidence_score)
     return {
         "company_id": record.company_id,
         "company_name": record.company_name,
-        "is_acquired": True,
+        "is_acquired": bool(is_acquired),
+        "review_status": review_status,
         "likely_acquirer": candidate_name,
         "source": source,
         "confidence_score": confidence_score,
@@ -259,7 +327,8 @@ def run_combined_check(dwh_id: str, data_source: CompanyDataSource) -> dict:
 
     if name_match is not None:
         score, notes = _apply_cross_source_modifiers(
-            name_match["candidate_name"], name_match["confidence_score"], description_acquirer
+            name_match["candidate_name"], name_match["confidence_score"], description_acquirer,
+            name_match["matched_pattern"],
         )
         # No cross-source signal either way - fall back to whatever note
         # (if any) the name-matching side's own modifier already set, e.g.

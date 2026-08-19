@@ -43,7 +43,11 @@ for _subdir in ("name_matching", "description_matching"):
         sys.path.insert(0, _path)
 
 from check_name_signals import _company_identity_match, check_company_record  # noqa: E402 (from name_matching)
-from combined_check import _apply_structured_field_confidence_boost  # noqa: E402
+from combined_check import (  # noqa: E402
+    _apply_structured_field_confidence_boost,
+    _conflict_capped_score,
+    classify_review_status,
+)
 from data_source import CompanyDataSource, ElasticCompanyDataSource  # noqa: E402 (from name_matching)
 from description_detection_api import extract_acquirer_from_description  # noqa: E402 (from description_matching)
 from json_data_source import JsonCompanyDataSource  # noqa: E402
@@ -120,6 +124,11 @@ def _combine_results(
     _apply_structured_field_confidence_boost() post-processing step below can
     see fundingAndInvestment.acquiredBy.acquirerCompanyName; without it, that
     step is skipped.
+
+    Every branch's returned score is run through classify_review_status()
+    LAST (after the structured-field boost, so it sees the final number) to
+    set isAcquired/reviewStatus - see that function in combined_check.py for
+    why a match isn't always isAcquired=1.
     """
     description_acquirer = (
         description_match["acquirerCompany"]
@@ -128,7 +137,15 @@ def _combine_results(
     )
 
     if name_match is None and description_acquirer is None:
-        return {"isAcquired": 0, "acquirerCompany": None, "source": None, "matchedPattern": None, "confidenceScore": None}
+        is_acquired, review_status = classify_review_status(None)
+        return {
+            "isAcquired": is_acquired,
+            "acquirerCompany": None,
+            "source": None,
+            "matchedPattern": None,
+            "confidenceScore": None,
+            "reviewStatus": review_status,
+        }
 
     if name_match is not None and description_acquirer is None:
         matched_pattern = name_match["matched_pattern"]
@@ -145,24 +162,28 @@ def _combine_results(
         # structured_field row in a full-batch run.
         if raw is not None and matched_pattern != "structured_field":
             score, _ = _apply_structured_field_confidence_boost(score, notes, raw)
+        is_acquired, review_status = classify_review_status(score)
         return {
-            "isAcquired": 1,
+            "isAcquired": is_acquired,
             "acquirerCompany": name_match["candidate_name"],
             "source": "company_name",
             "matchedPattern": matched_pattern,
             "confidenceScore": score,
+            "reviewStatus": review_status,
         }
 
     if name_match is None and description_acquirer is not None:
         score = description_match.get("confidenceScore")
         if raw is not None:
             score, _ = _apply_structured_field_confidence_boost(score, None, raw)
+        is_acquired, review_status = classify_review_status(score)
         return {
-            "isAcquired": 1,
+            "isAcquired": is_acquired,
             "acquirerCompany": description_acquirer,
             "source": "description",
             "matchedPattern": description_match["matchedPattern"],
             "confidenceScore": score,
+            "reviewStatus": review_status,
         }
 
     # Both paths found a candidate - compare them.
@@ -182,12 +203,14 @@ def _combine_results(
         notes = name_match.get("confidence_notes") if matched_pattern == "structured_field" else None
         if raw is not None and matched_pattern != "structured_field":
             confidence_score, _ = _apply_structured_field_confidence_boost(confidence_score, notes, raw)
+        is_acquired, review_status = classify_review_status(confidence_score)
         return {
-            "isAcquired": 1,
+            "isAcquired": is_acquired,
             "acquirerCompany": acquirer,
             "source": "both",
             "matchedPattern": matched_pattern,
             "confidenceScore": confidence_score,
+            "reviewStatus": review_status,
         }
 
     if name_wins:
@@ -212,16 +235,23 @@ def _combine_results(
         description_acquirer,
         primary_acquirer,
     )
+    # How hard the conflict discounts primary_score depends on how trusted
+    # primary_pattern is - see combined_check._is_high_trust_pattern(). This
+    # branch previously applied no cap at all, unlike combined_check.py's
+    # own _apply_cross_source_modifiers() - now both agree.
+    primary_score = _conflict_capped_score(primary_score, primary_pattern)
     if raw is not None and primary_pattern != "structured_field":
         # primary_pattern != "structured_field" here (guarded above), so
         # there's no structured_field_uncorroborated note to pass through.
         primary_score, _ = _apply_structured_field_confidence_boost(primary_score, None, raw)
+    is_acquired, review_status = classify_review_status(primary_score)
     return {
-        "isAcquired": 1,
+        "isAcquired": is_acquired,
         "acquirerCompany": primary_acquirer,
         "source": primary_source,
         "matchedPattern": primary_pattern,
         "confidenceScore": primary_score,
+        "reviewStatus": review_status,
     }
 
 
@@ -240,6 +270,7 @@ def process_company(dwh_id: str, data_source: CompanyDataSource) -> dict[str, An
                 "source": None,
                 "matchedPattern": None,
                 "confidenceScore": None,
+                "reviewStatus": None,
             }
 
         name_match = check_company_record(record)
@@ -261,6 +292,7 @@ def process_company(dwh_id: str, data_source: CompanyDataSource) -> dict[str, An
             "source": None,
             "matchedPattern": None,
             "confidenceScore": None,
+            "reviewStatus": None,
         }
 
 
@@ -274,7 +306,8 @@ def _create_table(conn: sqlite3.Connection) -> None:
             acquirerCompany TEXT,
             source TEXT,
             matchedPattern TEXT,
-            confidenceScore REAL
+            confidenceScore REAL,
+            reviewStatus TEXT
         )
         """
     )
@@ -282,6 +315,8 @@ def _create_table(conn: sqlite3.Connection) -> None:
     existing_columns = {row[1] for row in conn.execute("PRAGMA table_info(combined_acquisitions)")}
     if "confidenceScore" not in existing_columns:
         conn.execute("ALTER TABLE combined_acquisitions ADD COLUMN confidenceScore REAL")
+    if "reviewStatus" not in existing_columns:
+        conn.execute("ALTER TABLE combined_acquisitions ADD COLUMN reviewStatus TEXT")
 
     conn.commit()
 
@@ -299,12 +334,15 @@ def _safe_str(value: Any) -> str:
 def _print_results(conn: sqlite3.Connection, dwh_ids: list[str]) -> None:
     placeholders = ",".join("?" * len(dwh_ids))
     rows = conn.execute(
-        f"SELECT dwhId, companyName, isAcquired, acquirerCompany, source, matchedPattern, confidenceScore "
+        f"SELECT dwhId, companyName, isAcquired, acquirerCompany, source, matchedPattern, confidenceScore, reviewStatus "
         f"FROM combined_acquisitions WHERE dwhId IN ({placeholders})",
         dwh_ids,
     ).fetchall()
 
-    headers = ["dwhId", "companyName", "isAcquired", "acquirerCompany", "source", "matchedPattern", "confidenceScore"]
+    headers = [
+        "dwhId", "companyName", "isAcquired", "acquirerCompany", "source", "matchedPattern",
+        "confidenceScore", "reviewStatus",
+    ]
     widths = [
         max(len(headers[i]), *(len(_safe_str(row[i])) for row in rows)) if rows else len(headers[i])
         for i in range(len(headers))
@@ -355,8 +393,8 @@ def main() -> None:
     for row in results:
         conn.execute(
             "INSERT OR REPLACE INTO combined_acquisitions "
-            "(dwhId, companyName, isAcquired, acquirerCompany, source, matchedPattern, confidenceScore) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "(dwhId, companyName, isAcquired, acquirerCompany, source, matchedPattern, confidenceScore, reviewStatus) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 row["dwhId"],
                 row["companyName"],
@@ -365,6 +403,7 @@ def main() -> None:
                 row["source"],
                 row["matchedPattern"],
                 row["confidenceScore"],
+                row["reviewStatus"],
             ),
         )
     conn.commit()
