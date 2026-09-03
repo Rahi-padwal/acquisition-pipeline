@@ -1,0 +1,1 @@
+4faf326b0ada469ce4ae28d1ad7f8bb6uv run python logo_detection.py one_dwhid.csv warmup.db warmup_output.xlsx

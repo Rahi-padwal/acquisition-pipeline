@@ -1,0 +1,17 @@
+[project]
+name = "acquired-company"
+version = "0.1.0"
+description = "Detect whether a company has been acquired"
+requires-python = ">=3.13"
+dependencies = [
+    "requests",
+    "urllib3",
+    "python-dotenv",
+    "fastapi",
+    "pydantic",
+    "uvicorn",
+    "elasticsearch",
+    "boto3",
+    "pandas",
+    "openpyxl",
+]

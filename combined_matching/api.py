@@ -1,7 +1,9 @@
 """FastAPI wrapper around combined_check.run_combined_check().
 
-Runs name_matching's checks first, falling back to description_matching's
-phrase-pattern detection only when the name-based check finds nothing.
+Runs name_matching's checks and description_matching's phrase-pattern
+detection, both always, so their outputs can be cross-checked for
+confidence scoring; name-based results still win as likely_acquirer when
+both fire. See combined_check.py for details.
 
 Run with: python -m uvicorn api:app --reload --port 8004
 Docs at:  http://127.0.0.1:8004/docs
@@ -41,6 +43,8 @@ class CheckResponse(BaseModel):
     is_acquired: bool
     likely_acquirer: str | None
     source: str | None
+    confidence_score: float | None
+    confidence_notes: str | None
     evidence: list[Evidence]
 
 

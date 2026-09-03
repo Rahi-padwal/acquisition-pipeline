@@ -56,26 +56,142 @@ _WHOLLY_OWNED_SUBSIDIARY = re.compile(
     r"operates\s+as\s+an?\s+wholly[\s-]+owned\s+subsidiary\s+of\s+(?P<acquirer>" + _NAME_CAPTURE + r")" + _NAME_TERMINATOR,
     re.IGNORECASE,
 )
-_JOINED_FORCES = re.compile(
-    r"has\s+joined\s+forces\s+with\s+(?P<acquirer>" + _NAME_CAPTURE + r")" + _NAME_TERMINATOR,
+# --- joined_forces-specific list/partnership guard ---------------------------
+#
+# "has joined forces with X" is genuinely ambiguous in the wild: the same
+# phrasing shows up both for real acquisitions ("has joined forces with Acme
+# Corp") AND for partnership/client-roster announcements ("has joined forces
+# with industry giants like Acme Corp", "has joined forces with Acme, Beta,
+# and Gamma") - the latter names a PARTNER or CLIENT, not an acquirer, and
+# should never be extracted as a confident single acquirer. Two independent,
+# vocabulary-general signals catch this shape without hardcoding any specific
+# company or noun list:
+#   (1) a list-introducing connector ("like" / "such as" / "including" / ...)
+#       sitting between the trigger phrase and the captured name - catches
+#       "industry giants like X", "leading companies such as X", "clients
+#       including X", etc. regardless of which noun precedes the connector.
+#   (2) multiple comma- or "and"-joined capitalized names attached to the
+#       captured name (either right after it, or "and"-joined inside it) -
+#       catches "has joined forces with X, Y, and Z" even when there's no
+#       connector word at all.
+# Either signal firing means this match is discarded entirely rather than
+# scored (see the joined_forces branch in extract_acquirer_from_description).
+_JOINED_FORCES_LIST_CONNECTOR = re.compile(
+    r"(?:like|such\s+as|including|comprising|e\.g\.?|to\s+name\s+(?:a\s+few|just\s+one|but\s+a\s+few))\s*$",
     re.IGNORECASE,
 )
+_JOINED_FORCES_MULTI_ENTITY_TAIL = re.compile(r"^(?:,\s*[A-Z][\w&.'-]*|\s+and\s+[A-Z])")
+# Deliberately NOT re.IGNORECASE: "and" joining two separate entities inside
+# the captured name (e.g. "Acme and Beta") is only a reliable list signal
+# when "and" is lowercase and what follows is capitalized like a new proper
+# noun - a real two-word company name containing "and" ("Johnson and
+# Johnson"-style) can still slip through here, accepted as a rare tradeoff.
+_JOINED_FORCES_MULTI_ENTITY_INTERNAL_AND = re.compile(r"[\w&.'-]+\s+and\s+[A-Z]")
+
+# Filler words between "joined forces with" and the actual acquirer name
+# ("industry giants like ", "leading companies such as ") are skipped
+# generically - any run of lowercase-initial words - rather than captured, so
+# the acquirer capture starts at the first proper-noun-like (capitalized)
+# token instead of the first word after the trigger phrase. (?-i:...) turns
+# case-folding off locally so this stays genuinely case-sensitive even though
+# the rest of the pattern is compiled with re.IGNORECASE. Tradeoff: a real
+# acquirer name stylized entirely in lowercase won't be captured by this
+# pattern; accepted as rare relative to the false-positive rate this fixes.
+_JOINED_FORCES_FILLER = r"(?:(?-i:[a-z][\w'-]*)\s+){0,4}"
+_JOINED_FORCES_ACQUIRER_CAPTURE = r"(?-i:[A-Z])[^,.;:()\n]{0,49}?"
+
+_JOINED_FORCES = re.compile(
+    r"has\s+joined\s+forces\s+with\s+" + _JOINED_FORCES_FILLER
+    + r"(?P<acquirer>" + _JOINED_FORCES_ACQUIRER_CAPTURE + r")" + _NAME_TERMINATOR,
+    re.IGNORECASE,
+)
+
+
+def _is_joined_forces_list_announcement(text: str, match: re.Match) -> bool:
+    """True when a _JOINED_FORCES match looks like a partnership/client-list
+    announcement rather than a genuine single-acquirer acquisition phrase -
+    see the module-level comment above _JOINED_FORCES_LIST_CONNECTOR for the
+    two signals checked."""
+    lead = match.group(0)[: match.start("acquirer") - match.start(0)]
+    if _JOINED_FORCES_LIST_CONNECTOR.search(lead):
+        return True
+
+    acquirer_text = match.group("acquirer")
+    if _JOINED_FORCES_MULTI_ENTITY_INTERNAL_AND.search(acquirer_text):
+        return True
+
+    tail = text[match.end("acquirer") : match.end("acquirer") + 60]
+    return bool(_JOINED_FORCES_MULTI_ENTITY_TAIL.match(tail))
+
+
+# --- joined_forces-specific non-acquirer / garbage-text filters --------------
+#
+# Manual review of ~40 real powered_by/joined_forces matches (name_matching
+# side and this description side together) turned up two more recurring
+# false-positive categories beyond the list-announcement shape above:
+# franchise-network/accelerator-fund organizations getting read as an
+# acquirer, and captures that are just over-grabbed prose with no real
+# company name in them. Mirrors name_matching/check_name_signals.py's
+# _is_non_acquirer_organization()/_is_garbage_acquirer_text() - duplicated
+# rather than imported since this module is intentionally standalone (own
+# FastAPI app, own ES client - see the module docstring), and only applied to
+# joined_forces here (this module has no powered_by pattern of its own).
+_NON_ACQUIRER_ORG_PREFIXES = ("proforma",)
+_ACCELERATOR_FUND_RE = re.compile(r"\b(accelerators?|akcelerator|funds?|idea)\b", re.IGNORECASE)
+
+
+def _is_non_acquirer_organization(candidate: str) -> bool:
+    normalized = candidate.strip().lower()
+    if any(normalized == prefix or normalized.startswith(prefix + " ") for prefix in _NON_ACQUIRER_ORG_PREFIXES):
+        return True
+    return bool(_ACCELERATOR_FUND_RE.search(candidate))
+
+
+_ACQUIRER_FILLER_PHRASE_RE = re.compile(
+    r"\b(?:leading|major|other|various|several|top|well[\s-]known|renowned|trusted)\b|\b(?:like|such\s+as|including)\b",
+    re.IGNORECASE,
+)
+_POWERED_BY_JOINED_FORCES_GENERIC_WORDS = {
+    "ai", "growth", "application", "applications", "verification",
+    "solution", "solutions", "platform", "platforms", "software",
+    "technology", "technologies", "digital", "data", "analytics",
+    "insights", "innovation", "innovations", "systems", "system",
+    "service", "services", "cloud", "network", "networks",
+}
+
+
+def _is_garbage_acquirer_text(candidate: str) -> bool:
+    if _ACQUIRER_FILLER_PHRASE_RE.search(candidate):
+        return True
+    capitalized_words = [w.strip(".,'-&") for w in candidate.split() if w[:1].isupper()]
+    capitalized_words = [w for w in capitalized_words if w]
+    if not capitalized_words:
+        return True
+    return all(w.lower() in _POWERED_BY_JOINED_FORCES_GENERIC_WORDS for w in capitalized_words)
+
+
 _FORMERLY = re.compile(
     r"\bformerly\s+(?:known\s+as\s+)?(?P<acquirer>" + _NAME_CAPTURE + r")" + _NAME_TERMINATOR,
     re.IGNORECASE,
 )
-_STAY_UP_TO_DATE = re.compile(
-    r"to\s+stay\s+up\s+to\s+date\s+on\s+(?P<acquirer>" + _NAME_CAPTURE + r")" + _NAME_TERMINATOR,
-    re.IGNORECASE,
-)
-# "X is now Y" / "X are now Y" - primary, high-confidence trigger (same tier
-# as was_acquired_by). Added because the real acquisition signal is often
-# stated this way rather than via "formerly" - e.g. "Emburse Go (formerly
-# Roadmap) is now Emburse." - the acquirer here is "Emburse", not "Roadmap".
-_IS_NOW = re.compile(
-    r"\b(?:is|are)\s+now\s+(?P<acquirer>" + _NAME_CAPTURE + r")" + _NAME_TERMINATOR,
-    re.IGNORECASE,
-)
+# Removed: "to stay up to date on X" (matched_pattern "stay_up_to_date") used
+# to live here, scored 0.5. Pulled entirely after manual review found it was
+# 100% false positive across every sample checked - 5/5 across two separate
+# verification passes, with zero true positives observed. Unlike is_now
+# (which had a real minority of genuine catches worth weighing against the
+# noise), this pattern had nothing to trade off, so it's a straight removal
+# rather than a confidence demotion.
+#
+# Removed: "X is now Y" / "X are now Y" (matched_pattern "is_now") used to
+# live here, scored at the top confidence tier (1.0) alongside was_acquired_by.
+# Pulled entirely after auditing all 2,316 is_now rows in
+# combined_matching/acquired_companies.csv: ~87% were garbage-text captures
+# ("is now available", "is now closed", "is now co-owned by Sonny and their
+# partner" - sentence continuations, not company names), the worst false-
+# positive rate of any pattern in the pipeline despite carrying its highest
+# confidence score. A minority of genuine catches (e.g. "Network for Good is
+# now Bonterra") are lost with it; some of those may still surface via the
+# formerly fallback below at lower confidence, but not all will.
 
 # Bare "formerly" count, used by the consolidator heuristic below - doesn't
 # need a capture group, just a count of occurrences.
@@ -98,9 +214,7 @@ _DESCRIPTION_PATTERNS: list[tuple[str, re.Pattern]] = [
     ("was_acquired_by", _WAS_ACQUIRED_BY),
     ("wholly_owned_subsidiary", _WHOLLY_OWNED_SUBSIDIARY),
     ("joined_forces", _JOINED_FORCES),
-    ("is_now", _IS_NOW),
     ("formerly", _FORMERLY),
-    ("stay_up_to_date", _STAY_UP_TO_DATE),
 ]
 
 
@@ -108,12 +222,37 @@ def _clean_acquirer(raw: str) -> str:
     return re.sub(r"\s+", " ", raw).strip().strip(")").strip()
 
 
+# --- Confidence scoring -------------------------------------------------------
+#
+# Base score per matched_pattern, 0.0-1.0. This is the only place these
+# numbers live - adjust here, not per call site. "formerly" is included for
+# completeness/documentation even though it's currently unreachable as a
+# scored positive match (extract_acquirer_from_description() never returns
+# an acquirerCompany for a standalone "formerly" - see that function's
+# docstring); if that demotion is ever revisited, the score is already here.
+#
+# Cross-source modifiers (corroboration/conflict against the companyName-
+# based path) are NOT applied here - this module only sees the description
+# field in isolation, so that logic lives in combined_matching/combined_check.py,
+# the one place both detectors' outputs are visible together.
+_PATTERN_BASE_CONFIDENCE: dict[str, float] = {
+    "was_acquired_by": 1.0,
+    "wholly_owned_subsidiary": 1.0,
+    "joined_forces": 0.7,
+    "formerly": 0.3,
+}
+
+
+def _base_confidence_for_pattern(matched_pattern: str) -> float:
+    return _PATTERN_BASE_CONFIDENCE.get(matched_pattern, 0.5)
+
+
 def extract_acquirer_from_description(description: str | None) -> dict[str, Any] | None:
     """Scan `description` for acquisition-indicating phrases.
 
     Tries patterns in priority order: was_acquired_by > wholly_owned_subsidiary
-    > joined_forces > is_now > formerly (supporting-only, see below) >
-    stay_up_to_date. Returns None if there's no description or nothing
+    > joined_forces > formerly (supporting-only, see below). Returns None if
+    there's no description or nothing
     matches, otherwise:
         {"acquirerCompany": str | None, "matchedPattern": str,
          "confidence": "high" | "low", "nameChanged": bool,
@@ -153,6 +292,7 @@ def extract_acquirer_from_description(description: str | None) -> dict[str, Any]
             "acquirerCompany": None,
             "matchedPattern": "formerly",
             "confidence": "low",
+            "confidenceScore": _base_confidence_for_pattern("formerly"),
             "nameChanged": True,
             "isLikelyAcquirer": True,
             "rawText": formerly_match.group(0) if formerly_match else "formerly",
@@ -162,14 +302,25 @@ def extract_acquirer_from_description(description: str | None) -> dict[str, Any]
         ("was_acquired_by", _WAS_ACQUIRED_BY),
         ("wholly_owned_subsidiary", _WHOLLY_OWNED_SUBSIDIARY),
         ("joined_forces", _JOINED_FORCES),
-        ("is_now", _IS_NOW),
     ):
         m = pattern.search(text)
+        if m and pattern_name == "joined_forces" and (
+            _is_joined_forces_list_announcement(text, m)
+            or _is_non_acquirer_organization(m.group("acquirer"))
+            or _is_garbage_acquirer_text(m.group("acquirer"))
+        ):
+            # Partnership/client-list announcement, known non-acquirer org
+            # (franchise network/accelerator/fund), or over-captured prose -
+            # not a confident single acquirer either way. Discard entirely
+            # (don't score, don't return) rather than picking one name out;
+            # the remaining patterns below still get a chance to match.
+            m = None
         if m:
             return {
                 "acquirerCompany": _clean_acquirer(m.group("acquirer")),
                 "matchedPattern": pattern_name,
                 "confidence": "high",
+                "confidenceScore": _base_confidence_for_pattern(pattern_name),
                 # formerly demoted: a same-text "formerly" mention no longer
                 # drives its own match, it just rides along as evidence that
                 # the name also changed alongside this stronger signal.
@@ -189,20 +340,10 @@ def extract_acquirer_from_description(description: str | None) -> dict[str, Any]
             "acquirerCompany": None,
             "matchedPattern": "formerly",
             "confidence": "low",
+            "confidenceScore": _base_confidence_for_pattern("formerly"),
             "nameChanged": True,
             "isLikelyAcquirer": False,
             "rawText": formerly_match.group(0),
-        }
-
-    stay_up_to_date_match = _STAY_UP_TO_DATE.search(text)
-    if stay_up_to_date_match:
-        return {
-            "acquirerCompany": _clean_acquirer(stay_up_to_date_match.group("acquirer")),
-            "matchedPattern": "stay_up_to_date",
-            "confidence": "low",
-            "nameChanged": False,
-            "isLikelyAcquirer": False,
-            "rawText": stay_up_to_date_match.group(0),
         }
 
     return None
@@ -248,6 +389,8 @@ def _not_acquired_result(dwh_id: str, company_name: str | None) -> dict[str, Any
         "company_name": company_name,
         "is_acquired": False,
         "likely_acquirer": None,
+        "confidence_score": None,
+        "confidence_notes": None,
         "evidence": [],
     }
 
@@ -269,6 +412,11 @@ def _build_result(dwh_id: str, source: dict[str, Any] | None) -> dict[str, Any]:
         "company_name": company_name,
         "is_acquired": True,
         "likely_acquirer": match["acquirerCompany"],
+        # No cross-source modifiers here - this module only sees the
+        # description field, so confidence_notes stays None unless a future
+        # caller (e.g. combined_check.py) recomputes it with more context.
+        "confidence_score": match["confidenceScore"],
+        "confidence_notes": None,
         "evidence": [
             {
                 "candidate_name": match["acquirerCompany"],
@@ -291,6 +439,8 @@ def fetch_and_detect(dwh_id: str, es_client: Elasticsearch) -> dict[str, Any]:
             "company_name": None,
             "is_acquired": None,
             "likely_acquirer": None,
+            "confidence_score": None,
+            "confidence_notes": None,
             "evidence": [],
         }
 
@@ -315,6 +465,8 @@ class DetectionResult(BaseModel):
     company_name: str | None
     is_acquired: bool | None
     likely_acquirer: str | None
+    confidence_score: float | None
+    confidence_notes: str | None
     evidence: list[Evidence]
 
 

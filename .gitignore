@@ -2,6 +2,7 @@ __pycache__/
 *.pyc
 .env
 *.db
+*.db.pre_merge_backup
 web_scraping/
 .venv/
 .claude/
