@@ -112,7 +112,7 @@ def _run_stage12(dwh_id: str, data_source: CompanyDataSource) -> dict[str, Any]:
         # _combine_results' own isAcquired value as-is rather than letting
         # classify_review_status's score-threshold isAcquired override it,
         # since that determination belongs to the untouched detection logic.
-        _, review_status = classify_review_status(combined.get("confidenceScore"))
+        _, review_status = classify_review_status(combined.get("confidenceScore"), combined.get("matchedPattern"))
         combined = {**combined, "reviewStatus": review_status}
         description_acquirer = (
             description_match["acquirerCompany"]

@@ -6,3 +6,5 @@ __pycache__/
 web_scraping/
 .venv/
 .claude/
+combined_matching/*_snapshot.csv
+combined_matching/*_snapshot.xlsx

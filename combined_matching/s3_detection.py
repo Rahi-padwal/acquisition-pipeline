@@ -221,15 +221,6 @@ _PROVIDED_BY = re.compile(
 # company). Do not re-add without a guard rejecting boilerplate acquirer
 # text ("us", "we", "its licensors", "its affiliates", etc.).
 
-# Backward capture: acquirer appears BEFORE the trigger phrase ("Acme
-# Holdings, its parent company"). Relies on search()'s leftmost-match
-# behavior to pull in the whole preceding name run up to the comma - see
-# module history/PR notes if this needs adjusting, non-greedy quantifiers
-# at a fixed starting position still expand until the rest of the pattern
-# can match, so this naturally captures the full preceding phrase.
-_PARENT_COMPANY = re.compile(
-    r"(?P<acquirer>[A-Za-z0-9][^,.;:()\n]{0,49}?),\s+its\s+parent\s+company\b", re.IGNORECASE
-)
 _COMPANY_WITHIN_GROUP = re.compile(
     r"a\s+company\s+within\s+the\s+(?P<acquirer>" + _NAME_CAPTURE + r")\s+group", re.IGNORECASE
 )
@@ -250,7 +241,6 @@ _S3_PATTERNS: list[tuple[str, re.Pattern, float]] = [
     ("acquirer_acquires_self", _ACQUIRER_ACQUIRES_SELF, 1.0),
     ("joined_forces_with", _JOINED_FORCES, 0.7),
     ("provided_by", _PROVIDED_BY, 1.0),
-    ("parent_company", _PARENT_COMPANY, 1.0),
     ("company_within_group", _COMPANY_WITHIN_GROUP, 1.0),
 ]
 
@@ -259,8 +249,8 @@ _PATTERN_BASE_CONFIDENCE: dict[str, float] = {name: score for name, _, score in 
 
 def _clean_acquirer(raw: str) -> str:
     text = re.sub(r"\s+", " ", raw).strip().strip(")").strip()
-    # Backward captures (parent_company) and generic prefixes ("part of THE
-    # Acme Group") can pick up a leading article - strip it.
+    # Generic prefixes ("part of THE Acme Group") can pick up a leading
+    # article - strip it.
     return re.sub(r"^(?:the|a|an)\s+", "", text, flags=re.IGNORECASE).strip()
 
 
@@ -413,12 +403,11 @@ def _is_joined_forces_list_announcement(text: str, match: re.Match) -> bool:
 # the actual grammatical subject directly - the same principle
 # acquirer_acquires_self already applies to its own target via
 # _mentions_subject_company, generalized to every pattern with this shape.
-# provided_by, parent_company, and company_within_group are deliberately
-# excluded: provided_by's ToS phrasing rarely has the company name in
-# prose immediately before it (a strict check would mostly just reject
-# genuine matches); parent_company's self entity is typically referenced
-# by pronoun ("we/our") rather than by name; and company_within_group's
-# natural real-world phrasing is self-referential without ever restating
+# provided_by and company_within_group are deliberately excluded:
+# provided_by's ToS phrasing rarely has the company name in prose
+# immediately before it (a strict check would mostly just reject genuine
+# matches); and company_within_group's natural real-world phrasing is
+# self-referential without ever restating
 # the subject's own name ("We are a company within the X group" - a real
 # case tested and confirmed to false-reject under this check), unlike the
 # patterns below where every confirmed real match this session explicitly
@@ -461,7 +450,7 @@ def extract_acquirer_from_s3_text(text: str, company_name: str | None = None) ->
          _subject_mentioned_nearby (requires the subject's name to appear
          shortly before the trigger phrase - see that function), and for
          acquirer_acquires_self via _mentions_subject_company on its
-         target. NOT guarded for provided_by or parent_company - see
+         target. NOT guarded for provided_by - see
          _PATTERNS_REQUIRING_NEARBY_SUBJECT's comment for why.
       2. joined_forces_with can still be a partnership announcement even
          after the list-announcement guard - that guard catches the common
@@ -648,7 +637,7 @@ def fetch_all_scrapes(
 # those functions decide "high-trust" by checking a matched_pattern's base
 # score in ONLY the name_matching and description_detection_api tables -
 # several of this module's own pattern names (provided_by, is_owned_by,
-# parent_company, company_within_group) don't exist in either table and
+# company_within_group) don't exist in either table and
 # would silently fall through to the LOW-trust conflict cap even though
 # they're scored 1.0 here. This version checks all three pattern tables.
 def _is_high_trust_pattern(matched_pattern: str) -> bool:
@@ -764,7 +753,7 @@ def merge_s3_result_into_db(
         # Fresh detection: either dwhId never seen before, or it was seen
         # but no other source ever found an acquirer for it (nothing to
         # corroborate/conflict against) - the S3 evidence stands on its own.
-        is_acquired, review_status = classify_review_status(score)
+        is_acquired, review_status = classify_review_status(score, pattern)
         conn.execute(
             "INSERT OR REPLACE INTO combined_acquisitions "
             "(dwhId, companyName, isAcquired, acquirerCompany, source, matchedPattern, confidenceScore, reviewStatus) "
@@ -783,7 +772,7 @@ def merge_s3_result_into_db(
     adjusted_score, notes = _apply_cross_source_modifiers(
         existing["acquirerCompany"], existing["confidenceScore"] or 0.0, acquirer, existing["matchedPattern"]
     )
-    is_acquired, review_status = classify_review_status(adjusted_score)
+    is_acquired, review_status = classify_review_status(adjusted_score, existing["matchedPattern"])
     conn.execute(
         "UPDATE combined_acquisitions SET isAcquired = ?, confidenceScore = ?, reviewStatus = ? WHERE dwhId = ?",
         (is_acquired, adjusted_score, review_status, dwh_id),

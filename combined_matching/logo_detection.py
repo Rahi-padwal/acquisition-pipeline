@@ -183,7 +183,7 @@ def merge_logo_result_into_db(
     acquirer, pattern, score = logo_result["acquirerCompany"], logo_result["matchedPattern"], logo_result["confidenceScore"]
 
     if existing is None or not existing["acquirerCompany"]:
-        is_acquired, review_status = classify_review_status(score)
+        is_acquired, review_status = classify_review_status(score, pattern)
         conn.execute(
             "INSERT OR REPLACE INTO combined_acquisitions "
             "(dwhId, companyName, isAcquired, acquirerCompany, source, matchedPattern, confidenceScore, reviewStatus) "
@@ -195,7 +195,7 @@ def merge_logo_result_into_db(
     adjusted_score, notes = _apply_cross_source_modifiers(
         existing["acquirerCompany"], existing["confidenceScore"] or 0.0, acquirer, existing["matchedPattern"]
     )
-    is_acquired, review_status = classify_review_status(adjusted_score)
+    is_acquired, review_status = classify_review_status(adjusted_score, existing["matchedPattern"])
     conn.execute(
         "UPDATE combined_acquisitions SET isAcquired = ?, confidenceScore = ?, reviewStatus = ? WHERE dwhId = ?",
         (is_acquired, adjusted_score, review_status, dwh_id),
@@ -411,7 +411,7 @@ def main(input_path: str, db_path: str, output_xlsx: str) -> None:
                     "(description=%r vs %r) - description never blocks this override",
                     r["dwhId"], r["descriptionAcquirer"], r["acquirerCompany"],
                 )
-        _, review_status = classify_review_status(1.0)
+        _, review_status = classify_review_status(1.0, r["matchedPattern"])
         conn.execute(
             "UPDATE combined_acquisitions SET isAcquired = 1, confidenceScore = 1.0, reviewStatus = ? WHERE dwhId = ?",
             (review_status, r["dwhId"]),

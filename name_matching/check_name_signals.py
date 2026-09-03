@@ -7,9 +7,9 @@ from data_source import CompanyDataSource, CompanyRecord
 # Capital letter + up to 50 more name-shaped chars.
 _NAME_CAPTURE = r"[A-Z][\w&.,' -]{1,50}?"
 
-# Stricter variant used only by powered_by/joined_forces_with/self_by_acquirer
-# (the same three riskiest patterns already gated by _FILTERED_PATTERNS
-# below). _NAME_CAPTURE's char class allows embedded periods/commas with no
+# Stricter variant used only by powered_by/joined_forces_with (the same two
+# riskiest patterns already gated by _FILTERED_PATTERNS below). _NAME_CAPTURE's
+# char class allows embedded periods/commas with no
 # stopping point short of end-of-string, which is exactly what let a case
 # like "TBWA Indonesia - Powered by AI. Driven by Disruption for Digital
 # Growth." swallow the ENTIRE marketing tagline as the "acquirer" (nothing
@@ -113,13 +113,6 @@ _NAME_ACQUIRER_PATTERNS = [
         "acquirer_acquires_self",
         re.compile(
             r"^(?P<acquirer>" + _NAME_CAPTURE + r"),?\s+(?i:acquires)\s+(?P<self>.+?)\)?\s*$"
-        ),
-    ),
-    (
-        # "Nest by Google" - riskier, "by" is common outside acquisitions too.
-        "self_by_acquirer",
-        re.compile(
-            r"^(?P<self>.+?),?\s+(?i:by)\s+(?P<acquirer>" + _RISKY_ACQUIRER_CAPTURE + r")\)?\s*$"
         ),
     ),
 ]
@@ -294,36 +287,7 @@ def _is_garbage_acquirer_text(candidate: str) -> bool:
     return all(w.lower() in _POWERED_BY_JOINED_FORCES_GENERIC_WORDS for w in capitalized_words)
 
 
-# self_by_acquirer ("X by Y") gets both guards above (it's exactly as
-# ambiguous a trigger as powered_by/joined_forces_with - the code's own
-# comment on the pattern already calls it out as riskier) PLUS one more,
-# below: "X by Y" also fires on "Product by its own Developer" branding
-# (e.g. "NimbleS2P by Techpanion", "MPO Solution by Ngenio") where Y built
-# and owns X from the start - never acquired anything - which the acquirer-
-# side checks above can't catch since the acquirer name itself (Techpanion,
-# Ngenio) is a perfectly real, non-generic company name. The signal here is
-# on the SELF side instead: a self_name containing a product/tool-shaped
-# word is a tell that "self" names a product, not the acquired company.
-#
-# Known limitation, accepted rather than chased: this only catches
-# space-separated product words ("MPO Solution" -> catches "Solution").
-# A compound, no-space brand like "NimbleS2P" has no word boundary around
-# the embedded "S2P" for this check to find, so that shape still gets
-# through - a camelCase/acronym splitter to close that gap was considered
-# and skipped as not worth the fragility it would add.
-_PRODUCT_LIKE_SELF_WORDS = {
-    "solution", "solutions", "platform", "platforms", "suite", "system",
-    "systems", "software", "app", "apps", "tool", "tools", "module",
-    "engine", "portal", "dashboard",
-}
-
-
-def _is_product_like_self_name(self_name: str) -> bool:
-    words = [w.strip(".,()'\"-").lower() for w in self_name.split()]
-    return any(w in _PRODUCT_LIKE_SELF_WORDS for w in words if w)
-
-
-_FILTERED_PATTERNS = {"powered_by", "joined_forces_with", "self_by_acquirer"}
+_FILTERED_PATTERNS = {"powered_by", "joined_forces_with"}
 
 
 def _is_self_truncation(candidate: str, self_name: str) -> bool:
@@ -370,16 +334,6 @@ _PATTERN_BASE_CONFIDENCE: dict[str, float] = {
     "a_company_of": 0.9,                # "a company of X" - reverse of a_x_company, same family
     "a_x_brand": 0.9,                   # "a X brand" - same family as a_x_company
     "trading_as": 0.9,                  # "X, trading as Company"
-    # "Company by X" - demoted from 0.9 after manual review found 7/9 sampled
-    # matches were false positives (X is the product's own creator/developer,
-    # not an acquirer - e.g. "CoLumbo by Smart Soft Healthcare", "BeTalent by
-    # Zircon"). That's a real-world fact ("did Y buy X, or did Y build X?"),
-    # not a text-shape signal a regex can resolve on its own, so - unlike
-    # powered_by/joined_forces_with above - this isn't a case a garbage-text
-    # filter can fix; the low score instead lets combined_check.py's cross-
-    # source corroboration logic do the real work (bump back up when
-    # structured_field/description independently agree, stay low otherwise).
-    "self_by_acquirer": 0.3,
     "powered_by": 0.7,                  # "powered by X" - weakest explicit regex pattern
     "structured_field": 1.0,            # ES's own isAcquired/acquiredBy fields; see modifier below
     "funding_round_parenthetical": 0.7,  # "(part of X)" scraped from a funding-round label
@@ -446,16 +400,14 @@ def find_acquirer_in_name(company_name: str) -> dict | None:
         if pattern_name in _FILTERED_PATTERNS and (
             _is_non_acquirer_organization(acquirer) or _is_garbage_acquirer_text(acquirer)
         ):
-            # `return None`, not `continue`: self_by_acquirer ("X by Y") is a
-            # later, looser fallback in this same pattern list, and "powered
-            # by X" / "joined forces with X" text always ALSO matches "X by
-            # Y" - falling through would just let self_by_acquirer re-catch
-            # the exact text this filter just rejected. Other detectors
+            # `return None`, not `continue`: no later pattern in this list is
+            # loose enough to re-catch text a filter here just rejected, but
+            # stopping outright (rather than trying more patterns against the
+            # same name) keeps this from silently downgrading to a weaker
+            # pattern's match on the same rejected text. Other detectors
             # (structured_field, funding-round parenthetical, description-
             # based) are untouched and still run separately in
             # check_company_record().
-            return None
-        if pattern_name == "self_by_acquirer" and _is_product_like_self_name(self_name):
             return None
 
         return {

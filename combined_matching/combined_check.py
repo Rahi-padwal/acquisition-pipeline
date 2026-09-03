@@ -73,7 +73,7 @@ _CONFLICT_CAP = 0.4
 # well-proven pattern (part_of, division_of, structured_field, a_x_company,
 # ... - tested close to 100% reliable this session) disagreeing with a weak
 # description-side guess is a different situation than a shaky pattern
-# (self_by_acquirer, powered_by - tested ~25-28% true) disagreeing. High-
+# (powered_by - tested ~25-28% true) disagreeing. High-
 # trust patterns get the softer cap below instead of the full _CONFLICT_CAP.
 _HIGH_TRUST_CONFLICT_CAP = 0.7
 _HIGH_TRUST_MIN_BASE_SCORE = 0.9
@@ -203,14 +203,17 @@ def _apply_structured_field_confidence_boost(
 # a low-confidence one that merely matched SOME pattern - both used to come
 # back as isAcquired=1. Manual web-search verification against the full
 # 6,480-row batch output (~30 self_by_acquirer rows sampled by hand) found
-# self_by_acquirer - the only pattern that ever scores exactly 0.3 - wrong
-# roughly 3 times out of 4 when uncorroborated (genuine hits get lifted
-# above this floor already, by the corroboration bonus or the structured-
-# field boost above, so what's LEFT sitting at exactly 0.3 is
-# disproportionately noise). Rather than silently folding those rows into
-# isAcquired=0 (indistinguishable there from a company with no acquisition
-# evidence at all), they get their own bucket so a human can still review
-# them instead of the data just dropping them.
+# self_by_acquirer - at the time, the only name_matching pattern that ever
+# scored exactly 0.3 - wrong roughly 3 times out of 4 when uncorroborated
+# (genuine hits get lifted above this floor already, by the corroboration
+# bonus or the structured-field boost above, so what's LEFT sitting at
+# exactly 0.3 is disproportionately noise). self_by_acquirer itself was
+# later removed from check_name_signals.py entirely, but the floor stays -
+# logo_matching/detection.py's by_x pattern still scores exactly 0.3 for
+# the same "loosest/riskiest trigger" reason. Rather than silently folding
+# those rows into isAcquired=0 (indistinguishable there from a company with
+# no acquisition evidence at all), they get their own bucket so a human can
+# still review them instead of the data just dropping them.
 _REVIEW_FLOOR = 0.35
 
 STATUS_ACQUIRED = "acquired"
@@ -219,17 +222,50 @@ STATUS_ACQUIRED = "acquired"
 # opposite of what "likely" suggests, that's the wording asked for.
 STATUS_LIKELY_ACQUIRED = "likely_acquired"
 STATUS_NOT_ACQUIRED = "not_acquired"
+# Two more specific sub-buckets of "acquired" - product decision (2026-09-03):
+# these patterns describe a more precise relationship than a bare
+# acquisition, so a human reviewer wants them separated out rather than
+# lumped into STATUS_ACQUIRED. isAcquired stays 1 for both - only the
+# reviewStatus label changes.
+STATUS_WITHIN_GROUP = "within_group"
+STATUS_SUBSIDIARY = "subsidiary"
+
+# Keyed by matched_pattern name, not by which stage produced it - the same
+# underlying phrase gets the same bucket regardless of whether name_matching,
+# S3, or description_matching found it, even though each stage spells/scores
+# the pattern slightly differently. "joined_forces" (no "_with") is
+# description_matching's own name for the identical phrase name_matching/S3
+# call "joined_forces_with" - see each module's own _PATTERN_BASE_CONFIDENCE.
+_WITHIN_GROUP_PATTERNS = {"company_within_group", "division_of"}
+_SUBSIDIARY_PATTERNS = {
+    "is_a_subsidiary_of",
+    "joined_forces_with",
+    "joined_forces",
+    "wholly_owned_subsidiary",
+}
 
 
-def classify_review_status(score: float | None) -> tuple[int, str]:
+def classify_review_status(score: float | None, matched_pattern: str | None = None) -> tuple[int, str]:
     """(isAcquired, reviewStatus) for a row's FINAL confidence_score. Call
     this LAST, after every other adjustment (corroboration bonus/cap,
     structured-field boost) - those can move a score across the floor, so
-    calling this any earlier would classify against a stale number."""
+    calling this any earlier would classify against a stale number.
+
+    `matched_pattern` is optional and only changes anything once the score
+    already clears _REVIEW_FLOOR: _WITHIN_GROUP_PATTERNS/_SUBSIDIARY_PATTERNS
+    reclassify the label to STATUS_WITHIN_GROUP/STATUS_SUBSIDIARY instead of
+    STATUS_ACQUIRED (isAcquired unchanged). Omitting it (or passing a pattern
+    in neither set) reproduces the old two-bucket behavior exactly - existing
+    call sites that don't pass it are unaffected.
+    """
     if score is None:
         return 0, STATUS_NOT_ACQUIRED
     if score <= _REVIEW_FLOOR:
         return 0, STATUS_LIKELY_ACQUIRED
+    if matched_pattern in _WITHIN_GROUP_PATTERNS:
+        return 1, STATUS_WITHIN_GROUP
+    if matched_pattern in _SUBSIDIARY_PATTERNS:
+        return 1, STATUS_SUBSIDIARY
     return 1, STATUS_ACQUIRED
 
 
@@ -283,7 +319,7 @@ def _positive_result(
 
     # Same floor as the batch pipeline (test_combined_pipeline.py) - a match
     # isn't automatically is_acquired=True anymore, see classify_review_status().
-    is_acquired, review_status = classify_review_status(confidence_score)
+    is_acquired, review_status = classify_review_status(confidence_score, matched_pattern)
     return {
         "company_id": record.company_id,
         "company_name": record.company_name,

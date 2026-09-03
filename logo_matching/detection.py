@@ -5,14 +5,26 @@ description_matching/combined_matching) - same convention the rest of this
 project follows for sibling detectors: each source has different text
 shape and shouldn't require touching the others to change.
 
-Pattern set chosen (5 patterns) after inspecting real OCR output from the
+Pattern set chosen (4 patterns) after inspecting real OCR output from the
 sample logos in `logo data/`:
 
     powered_by      - "powered by X"
     a_x_company     - "a X company" / "an X company"
     part_of         - "part of X" (optionally "part of the X group")
-    x_group         - bare "X Group" mention, not already consumed by part_of
     by_x            - "by X" (loosest/riskiest trigger - low confidence)
+
+x_group (bare "X Group" mention, no relational trigger phrase at all) used
+to live here too - removed (2026-09-03) after a 60-match sample spanning
+its full capture-length range (1-45 chars) turned up virtually no genuine
+third-party acquirers, just self-references a company's own logo makes to
+its own "X Group" name, garbled by OCR just enough (acronym prefixes,
+dropped/substituted letters, word reordering) to dodge _is_self_reference's
+exact/prefix string comparison - "The Edge Group"->"EDGE", "KVADOS,
+a.s."->"KVADOS", "Premier Law Group PLLC"->"P L G PremieR LAW". Unlike
+every pattern still below, "X Group" alone carries no relational language
+("part of", "subsidiary of", "owned by") to distinguish an external
+acquirer from the subject naming itself - structural, not just noisy OCR,
+so patching the guard with fuzzier matching wasn't judged worth chasing.
 
 These were deliberately picked over the two existing sibling pattern sets
 in this project:
@@ -61,10 +73,6 @@ _A_X_COMPANY = re.compile(
 _PART_OF = re.compile(
     r"\bpart\s+of\s+(?:the\s+)?(?P<acquirer>" + _NAME_CAPTURE + r")\b(?:\s+group\b)?", re.IGNORECASE
 )
-# Bare "X Group" mention with no "part of" prefix - checked only as a
-# fallback (see _LOGO_PATTERNS ordering: part_of is tried first, so a
-# blob's "part of Acme Group" is consumed there and never reaches here).
-_X_GROUP = re.compile(r"\b(?P<acquirer>" + _NAME_CAPTURE + r")\s+group\b", re.IGNORECASE)
 # Loosest trigger - deliberately last, lowest-confidence, and most heavily
 # guarded (see _is_garbage_acquirer / _is_non_acquirer_organization below,
 # same filters name_matching applies to this exact trigger word).
@@ -76,7 +84,6 @@ _BY_X = re.compile(r"\bby\s+(?P<acquirer>" + _NAME_CAPTURE + r")" + _NAME_TERMIN
 _LOGO_PATTERNS: list[tuple[str, re.Pattern, float]] = [
     ("a_x_company", _A_X_COMPANY, 0.9),
     ("part_of", _PART_OF, 1.0),
-    ("x_group", _X_GROUP, 0.6),
     ("powered_by", _POWERED_BY, 0.7),
     ("by_x", _BY_X, 0.3),
 ]
@@ -87,7 +94,7 @@ _PATTERN_BASE_CONFIDENCE: dict[str, float] = {name: score for name, _, score in 
 # same set of trigger words name_matching flags as ambiguous, same reason:
 # "powered by"/"by X" show up for franchise branding, accelerators/funds,
 # and "product by its own developer" as often as for real acquisitions.
-_FILTERED_PATTERNS = {"powered_by", "by_x", "x_group"}
+_FILTERED_PATTERNS = {"powered_by", "by_x"}
 
 # Franchise/reseller network brands that caption every local franchisee's
 # site "powered by <brand> <franchisee>" - not an acquirer. Ported from
@@ -136,15 +143,18 @@ def _is_garbage_acquirer(acquirer: str, pattern_name: str) -> bool:
 # _is_self_reference - same list and same rationale as s3_detection.py's
 # _normalize_company_name. Added after a real false positive found running
 # this against the live EC2 db: company "Roga Group"'s logo just renders
-# "ROGA GROUP" (its own name), and x_group's capture ("ROGA") is NOT an
-# exact string match against the raw company name "Roga Group" (the
-# trailing "Group" breaks equality) - the old plain-equality check let it
-# through as a fabricated self-acquisition. Stripping the suffix from the
-# company name before comparing ("Roga Group" -> "roga") fixes this without
-# rejecting genuine matches: "TMG, an RIA company" strips to "tmg an ria"
-# (not equal to acquirer "ria"), so the real, already-validated TMG->RIA
-# corroboration case (see check_against_known.py) still passes correctly -
-# verified by re-running check_against_known.py after this change.
+# "ROGA GROUP" (its own name), and the (now-removed) x_group pattern's
+# capture ("ROGA") was NOT an exact string match against the raw company
+# name "Roga Group" (the trailing "Group" broke equality) - the old plain-
+# equality check let it through as a fabricated self-acquisition. Stripping
+# the suffix from the company name before comparing ("Roga Group" -> "roga")
+# fixes this without rejecting genuine matches: "TMG, an RIA company" strips
+# to "tmg an ria" (not equal to acquirer "ria"), so the real, already-
+# validated TMG->RIA corroboration case (see check_against_known.py) still
+# passes correctly - verified by re-running check_against_known.py after
+# this change. x_group itself is gone (see _LOGO_PATTERNS' docstring note),
+# but a_x_company/part_of/powered_by/by_x still rely on this same guard for
+# their own "X, an X company"-shaped self-references.
 _LEGAL_SUFFIX_RE = re.compile(
     r"\b(inc|llc|ltd|limited|corp|corporation|co|company|group|holdings|gmbh|plc|srl|sa|nv|bv)\b\.?", re.IGNORECASE
 )
