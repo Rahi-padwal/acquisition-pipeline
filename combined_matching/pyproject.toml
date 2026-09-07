@@ -14,4 +14,5 @@ dependencies = [
     "boto3",
     "pandas",
     "openpyxl",
+    "rapidfuzz>=3.14.6",
 ]
