@@ -12,3 +12,12 @@ combined_matching/*_snapshot.xlsx
 *_output*.csv
 timing_test_*
 out*.txt
+data/
+*.csv
+*.jpg
+*.jpeg
+*.png
+*.txt
+snapshot.json
+*checkpoint*.json
+name_matching/dwhId

@@ -11,7 +11,7 @@ that are combined into one confidence score.
 | `description_matching/` | 2 | Acquirer signals from the company description |
 | `logo_matching/` | 3 | Logo OCR signals (`detection.py`, `ocr.py`, `fetch_logo.py`, `es_client.py`) |
 | `combined_matching/` | all | Combines the stages: `combined_check.py`, S3 / logo detection, batch runners, DB migration |
-| `data/` | - | Input lists and samples (`dwhids_*.txt`, `logo_samples/`, `legacy/` old outputs) |
+| `data/` | Local-only inputs and samples (git-ignored, not in the repo) |
 
 Each stage folder is self-contained; `combined_matching` adds the sibling folders to `sys.path`.
 
