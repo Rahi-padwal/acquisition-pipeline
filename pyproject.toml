@@ -11,4 +11,11 @@ dependencies = [
     "pydantic",
     "uvicorn",
     "elasticsearch",
+    "boto3",
+    "pandas",
+    "openpyxl",
+    "paddleocr>=3.7.0",
+    "paddlepaddle>=3.2.2",
+    "opencv-contrib-python>=4.10.0.84",
+    "numpy>=2.3.5",
 ]

@@ -1,7 +1,15 @@
-"""Run the combined detection pipeline (companyName-based + description-
-based) over EVERY company in sellers_0726 that has categoriesLLM2
+"""Run the full 3-stage detection pipeline (companyName -> description ->
+S3 web scrape) over EVERY company in sellers_0726 that has categoriesLLM2
 populated - not a sample, the whole ~768k-document set (confirmed via a
 _count query - see the conversation this was built from).
+
+Stage 3 runs per-page, right after that page's stage 1+2 rows are
+committed, reusing s3_detection.py's fetch_all_scrapes()/
+extract_acquirer_from_s3_text()/merge_s3_result_into_db() unmodified - same
+corroboration/conflict logic as everywhere else in this project. At this
+scale (~768k companies x up to 6 S3 lookups each) stage 3 is the dominant
+cost of a full run - budget for it accordingly (see the conversation this
+was added from for a rough time estimate).
 
 Unlike test_combined_pipeline.py's random_score sampling, this paginates
 through the FULL matching set via search_after, sorted by dwhId.keyword
@@ -62,6 +70,16 @@ from description_detection_api import extract_acquirer_from_description  # noqa:
 
 from fetch_snapshot import _SOURCE_FIELDS  # noqa: E402
 from test_combined_pipeline import _combine_results  # noqa: E402
+from s3_detection import (  # noqa: E402
+    S3_BUCKET_NAME,
+    S3_PREFIX,
+    _s3_client,
+    combined_text_blob_multi,
+    extract_acquirer_from_s3_text,
+    fetch_all_scrapes,
+    list_pipeline_folders,
+    merge_s3_result_into_db,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -74,7 +92,12 @@ DB_PATH = "combined_acquisitions_full.db"
 CHECKPOINT_PATH = "full_batch_checkpoint.json"
 
 PAGE_SIZE = 1000
-MAX_WORKERS = 10
+MAX_WORKERS = 10  # stage 1+2: CPU-bound regex work, GIL-limited - more threads doesn't help here.
+# Stage 3: pure S3 HTTP calls, no CPU-bound work and no shared ES cluster to
+# overload - safe to run at much higher concurrency. Kept separate from
+# MAX_WORKERS above after a real run showed stage 3 dominating total
+# runtime at 10 workers (up to 6 S3 round-trips per company).
+S3_MAX_WORKERS = 64
 PROGRESS_EVERY = 5000
 
 _MAX_SEARCH_ATTEMPTS = 3
@@ -232,10 +255,24 @@ def _create_table(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
-def run_batch(es: Elasticsearch, conn: sqlite3.Connection) -> None:
+def _run_stage3_for_page(s3, folders: list[str], dwh_id: str) -> dict[str, Any]:
+    """Stage 3 (S3 web scrape) fetch + extraction only - no DB access, same
+    threading discipline as s3_detection.py's own process_dwh_id (DB writes
+    happen single-threaded afterward, per page)."""
+    scrapes, found_in = fetch_all_scrapes(s3, S3_BUCKET_NAME, folders, dwh_id)
+    if not scrapes:
+        return {"dwhId": dwh_id, "companyName": None, "s3_result": None, "no_data": True}
+    company_name = next((s.get("companyName") for s in scrapes if s.get("companyName")), None)
+    blob = combined_text_blob_multi(scrapes)
+    s3_result = extract_acquirer_from_s3_text(blob, company_name)
+    return {"dwhId": dwh_id, "companyName": company_name, "s3_result": s3_result, "no_data": False}
+
+
+def run_batch(es: Elasticsearch, conn: sqlite3.Connection, s3, s3_folders: list[str]) -> None:
     checkpoint = _load_checkpoint()
     search_after = checkpoint["last_dwh_id"]
     processed = checkpoint["processed"]
+    stage3_outcomes: dict[str, int] = {}
 
     if search_after is not None:
         logger.info("Resuming from checkpoint: %d companies already processed, last dwhId=%s", processed, search_after)
@@ -285,6 +322,25 @@ def run_batch(es: Elasticsearch, conn: sqlite3.Connection) -> None:
                 )
         conn.commit()
 
+        # Stage 3 (S3 web scrape) for this same page - runs AFTER the stage
+        # 1+2 commit above, so merge_s3_result_into_db() (which reads the
+        # existing row to decide corroboration/conflict) sees this page's
+        # fresh stage 1+2 verdict rather than a stale one from a prior run.
+        dwh_ids_this_page = [row["dwhId"] for row in results if row.get("dwhId")]
+        with ThreadPoolExecutor(max_workers=S3_MAX_WORKERS) as executor:
+            futures = [
+                executor.submit(_run_stage3_for_page, s3, s3_folders, dwh_id) for dwh_id in dwh_ids_this_page
+            ]
+            stage3_page_results = [future.result() for future in as_completed(futures)]
+
+        for row in stage3_page_results:
+            if row["no_data"]:
+                stage3_outcomes["no_s3_data"] = stage3_outcomes.get("no_s3_data", 0) + 1
+                continue
+            outcome = merge_s3_result_into_db(conn, row["dwhId"], row["companyName"], row["s3_result"])
+            stage3_outcomes[outcome] = stage3_outcomes.get(outcome, 0) + 1
+        conn.commit()
+
         processed += len(page)
         search_after = last_sort
         _save_checkpoint(search_after, processed)
@@ -308,6 +364,7 @@ def run_batch(es: Elasticsearch, conn: sqlite3.Connection) -> None:
     logger.info(
         "acquired=%d likely_acquired=%d not_acquired=%d errors=%d", acquired, likely_acquired, not_acquired, errors
     )
+    logger.info("stage 3 (S3): %s", stage3_outcomes)
 
 
 def main() -> None:
@@ -318,8 +375,12 @@ def main() -> None:
     conn = sqlite3.connect(DB_PATH)
     _create_table(conn)
 
+    s3 = _s3_client()
+    s3_folders = list_pipeline_folders(s3, S3_BUCKET_NAME, S3_PREFIX)
+    logger.info("S3 pipeline folders (newest first): %s", s3_folders)
+
     try:
-        run_batch(es, conn)
+        run_batch(es, conn, s3, s3_folders)
     finally:
         conn.close()
 
