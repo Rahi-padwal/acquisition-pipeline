@@ -3,6 +3,13 @@
 Detects whether a company has been acquired, using several independent signals
 that are combined into one confidence score.
 
+Accquired company:
+<img width="1156" height="435" alt="image" src="https://github.com/user-attachments/assets/a09dfc0e-00aa-4c28-944f-7704bcd036e1" />
+
+Not acquired company:
+<img width="1106" height="492" alt="image" src="https://github.com/user-attachments/assets/b6140388-cc7a-42fb-b88e-d467c023185d" />
+
+
 ## Layout
 
 | Folder | Stage | Purpose |
