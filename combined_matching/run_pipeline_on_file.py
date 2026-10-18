@@ -44,6 +44,7 @@ from check_name_signals import check_company_record  # noqa: E402 (from name_mat
 from data_source import CompanyDataSource, ElasticCompanyDataSource  # noqa: E402 (from name_matching)
 from description_detection_api import extract_acquirer_from_description  # noqa: E402 (from description_matching)
 
+from combined_check import classify_review_status  # noqa: E402
 from test_combined_pipeline import _combine_results  # noqa: E402
 from s3_detection import (  # noqa: E402
     S3_BUCKET_NAME,
@@ -69,6 +70,7 @@ DEFAULT_OUTPUT_XLSX = "full_pipeline_output.xlsx"
 OUTPUT_COLUMNS = [
     "dwhId", "companyName", "isAcquired", "acquirerCompany", "source",
     "matchedPattern", "confidenceScore", "reviewStatus",
+    "nameFound", "descriptionFound", "descriptionAcquirer", "s3Found", "logoFound",
 ]
 
 
@@ -82,7 +84,13 @@ def _read_dwh_ids(path: str) -> list[str]:
 
 
 def _run_stage12(dwh_id: str, data_source: CompanyDataSource) -> dict[str, Any]:
-    """Never raises - failures come back as isAcquired=None instead of dropping."""
+    """Never raises - failures come back as isAcquired=None instead of dropping.
+
+    nameFound/descriptionFound/descriptionAcquirer record what EACH detector
+    independently saw, alongside (not instead of) the existing merged verdict
+    from _combine_results() - _combine_results itself is untouched, this only
+    exposes information it already computes internally so the stage-4 all-
+    agree override (see logo_detection.py) has something to check later."""
     try:
         record = data_source.get_by_dwh_id(dwh_id)
         if record is None:
@@ -90,28 +98,53 @@ def _run_stage12(dwh_id: str, data_source: CompanyDataSource) -> dict[str, Any]:
                 "dwhId": dwh_id, "companyName": None, "isAcquired": None,
                 "acquirerCompany": None, "source": None, "matchedPattern": None,
                 "confidenceScore": None, "reviewStatus": None,
+                "nameFound": None, "descriptionFound": None, "descriptionAcquirer": None,
             }
         name_match = check_company_record(record)
         description_match = extract_acquirer_from_description(record.raw.get("description"))
         combined = _combine_results(name_match, description_match, record.raw)
-        return {"dwhId": dwh_id, "companyName": record.company_name, **combined}
+        # _combine_results() never sets reviewStatus (pre-existing gap in this
+        # script, unrelated to the nameFound/descriptionFound additions below -
+        # _write_stage12_row has always read row["reviewStatus"], so this was
+        # a latent KeyError waiting to be hit). Derive it the same way every
+        # other stage in this pipeline already does (s3_detection.py,
+        # logo_detection.py) via classify_review_status - but keep
+        # _combine_results' own isAcquired value as-is rather than letting
+        # classify_review_status's score-threshold isAcquired override it,
+        # since that determination belongs to the untouched detection logic.
+        _, review_status = classify_review_status(combined.get("confidenceScore"), combined.get("matchedPattern"))
+        combined = {**combined, "reviewStatus": review_status}
+        description_acquirer = (
+            description_match["acquirerCompany"]
+            if description_match is not None and description_match["acquirerCompany"] is not None
+            else None
+        )
+        return {
+            "dwhId": dwh_id, "companyName": record.company_name, **combined,
+            "nameFound": name_match is not None,
+            "descriptionFound": description_acquirer is not None,
+            "descriptionAcquirer": description_acquirer,
+        }
     except Exception as exc:
         print(f"  dwhId {dwh_id}: stage 1+2 failed - {exc}")
         return {
             "dwhId": dwh_id, "companyName": None, "isAcquired": None,
             "acquirerCompany": None, "source": None, "matchedPattern": None,
             "confidenceScore": None, "reviewStatus": None,
+            "nameFound": None, "descriptionFound": None, "descriptionAcquirer": None,
         }
 
 
 def _write_stage12_row(conn, row: dict[str, Any]) -> None:
     conn.execute(
         "INSERT OR REPLACE INTO combined_acquisitions "
-        "(dwhId, companyName, isAcquired, acquirerCompany, source, matchedPattern, confidenceScore, reviewStatus) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "(dwhId, companyName, isAcquired, acquirerCompany, source, matchedPattern, confidenceScore, reviewStatus, "
+        "nameFound, descriptionFound, descriptionAcquirer) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             row["dwhId"], row["companyName"], row["isAcquired"], row["acquirerCompany"],
             row["source"], row["matchedPattern"], row["confidenceScore"], row["reviewStatus"],
+            row["nameFound"], row["descriptionFound"], row["descriptionAcquirer"],
         ),
     )
 
@@ -184,6 +217,14 @@ def main(input_path: str, db_path: str, output_xlsx: str) -> None:
             continue
         outcome = merge_s3_result_into_db(conn, row["dwhId"], row["companyName"], row["s3_result"])
         stage3_outcomes[outcome] = stage3_outcomes.get(outcome, 0) + 1
+        # s3Found records whether THIS stage independently found an acquirer -
+        # separate from merge_s3_result_into_db's own corroborate/conflict
+        # verdict above, which is untouched. Only set when stage 3 actually
+        # ran (had scrape data) - no_data rows above leave it NULL, not False.
+        conn.execute(
+            "UPDATE combined_acquisitions SET s3Found = ? WHERE dwhId = ?",
+            (row["s3_result"] is not None, row["dwhId"]),
+        )
     conn.commit()
     print("Stage 3 done:", stage3_outcomes)
 

@@ -84,6 +84,7 @@ from combined_check import (  # noqa: E402
     _company_identity_match,
     classify_review_status,
 )
+from s3_detection import _ensure_stage_tracking_columns  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -97,6 +98,7 @@ DEFAULT_OUTPUT_XLSX = "logo_detection_output.xlsx"
 OUTPUT_COLUMNS = [
     "dwhId", "companyName", "isAcquired", "acquirerCompany", "source",
     "matchedPattern", "confidenceScore", "reviewStatus",
+    "nameFound", "descriptionFound", "descriptionAcquirer", "s3Found", "logoFound",
     "logoFetchOutcome", "logoMatchedPattern", "logoAcquirer", "logoRawText", "logoUrl",
 ]
 
@@ -152,6 +154,7 @@ def _create_table_if_missing(conn: Connection) -> None:
         """
     )
     conn.commit()
+    _ensure_stage_tracking_columns(conn)
 
 
 def merge_logo_result_into_db(
@@ -180,7 +183,7 @@ def merge_logo_result_into_db(
     acquirer, pattern, score = logo_result["acquirerCompany"], logo_result["matchedPattern"], logo_result["confidenceScore"]
 
     if existing is None or not existing["acquirerCompany"]:
-        is_acquired, review_status = classify_review_status(score)
+        is_acquired, review_status = classify_review_status(score, pattern)
         conn.execute(
             "INSERT OR REPLACE INTO combined_acquisitions "
             "(dwhId, companyName, isAcquired, acquirerCompany, source, matchedPattern, confidenceScore, reviewStatus) "
@@ -192,7 +195,7 @@ def merge_logo_result_into_db(
     adjusted_score, notes = _apply_cross_source_modifiers(
         existing["acquirerCompany"], existing["confidenceScore"] or 0.0, acquirer, existing["matchedPattern"]
     )
-    is_acquired, review_status = classify_review_status(adjusted_score)
+    is_acquired, review_status = classify_review_status(adjusted_score, existing["matchedPattern"])
     conn.execute(
         "UPDATE combined_acquisitions SET isAcquired = ?, confidenceScore = ?, reviewStatus = ? WHERE dwhId = ?",
         (is_acquired, adjusted_score, review_status, dwh_id),
@@ -279,7 +282,7 @@ def _ocr_worker(
         if fetch_result.outcome != "ok":
             row = {
                 "dwhId": dwh_id, "companyName": company_name, "logo_url": logo_url,
-                "fetch_outcome": fetch_result.outcome, "logo_result": None,
+                "fetch_outcome": fetch_result.outcome, "logo_result": None, "ocr_text": None,
             }
         else:
             ocr_result = run_ocr_array(fetch_result.image)
@@ -287,6 +290,11 @@ def _ocr_worker(
             row = {
                 "dwhId": dwh_id, "companyName": company_name, "logo_url": logo_url,
                 "fetch_outcome": "ok", "logo_result": logo_result,
+                # All detected lines, not just the high-confidence ones fed to
+                # extract_acquirer_from_logo_text above - kept for later spot-
+                # checking (run_logo_ocr_batch.py's logo_ocr_results table),
+                # not consumed by any matching logic here.
+                "ocr_text": ocr_result.text,
             }
 
         with results_lock:
@@ -368,9 +376,50 @@ def main(input_path: str, db_path: str, output_xlsx: str) -> None:
         row["outcome"] = outcome
         if row["logo_result"] is not None:
             matched_samples.append(row)
+        # logoFound records whether THIS stage independently found an
+        # acquirer - separate from merge_logo_result_into_db's own
+        # corroborate/conflict verdict above, which is untouched.
+        conn.execute(
+            "UPDATE combined_acquisitions SET logoFound = ? WHERE dwhId = ?",
+            (row["logo_result"] is not None, row["dwhId"]),
+        )
 
+    # --- Final aggregate: all-required-stages-agree confidence override ---
+    # Project decision: once name (stage 1), S3 scrape (stage 3), and logo
+    # (stage 4) have EACH independently found an acquirer - regardless of
+    # whether they named the same one - confidence is set to certain (1.0).
+    # Description (stage 2) is deliberately excluded from this requirement:
+    # it's the most error-prone source in the pipeline, so it may corroborate
+    # (logged below, for visibility) but is never allowed to block the
+    # override. This runs AFTER every existing corroborate/conflict decision
+    # above and only ever raises confidence on rows that already independently
+    # cleared 3 separate detectors - it does not change what any single stage
+    # decides counts as "an acquirer found" (check_company_record,
+    # extract_acquirer_from_description, extract_acquirer_from_s3_text, and
+    # extract_acquirer_from_logo_text are all untouched).
     conn.row_factory = Row
     placeholders = ",".join("?" * len(dwh_ids))
+    all_rows = conn.execute(f"SELECT * FROM combined_acquisitions WHERE dwhId IN ({placeholders})", dwh_ids).fetchall()
+    overridden = 0
+    for r in all_rows:
+        if not (r["nameFound"] and r["s3Found"] and r["logoFound"]):
+            continue
+        if r["descriptionFound"] and r["acquirerCompany"] and r["descriptionAcquirer"]:
+            if not _company_identity_match(r["descriptionAcquirer"], r["acquirerCompany"]):
+                logger.info(
+                    "dwhId %s: all-stages override applied despite description disagreeing "
+                    "(description=%r vs %r) - description never blocks this override",
+                    r["dwhId"], r["descriptionAcquirer"], r["acquirerCompany"],
+                )
+        _, review_status = classify_review_status(1.0, r["matchedPattern"])
+        conn.execute(
+            "UPDATE combined_acquisitions SET isAcquired = 1, confidenceScore = 1.0, reviewStatus = ? WHERE dwhId = ?",
+            (review_status, r["dwhId"]),
+        )
+        overridden += 1
+    if overridden:
+        print(f"All-stages-agree override: confidence set to 1.0 for {overridden} dwhId(s) (name+scrape+logo all independently found an acquirer)")
+
     db_rows = {
         r["dwhId"]: dict(r)
         for r in conn.execute(
@@ -411,6 +460,11 @@ def main(input_path: str, db_path: str, output_xlsx: str) -> None:
                 "matchedPattern": db_row.get("matchedPattern"),
                 "confidenceScore": db_row.get("confidenceScore"),
                 "reviewStatus": db_row.get("reviewStatus"),
+                "nameFound": db_row.get("nameFound"),
+                "descriptionFound": db_row.get("descriptionFound"),
+                "descriptionAcquirer": db_row.get("descriptionAcquirer"),
+                "s3Found": db_row.get("s3Found"),
+                "logoFound": db_row.get("logoFound"),
                 "logoFetchOutcome": row["outcome"],
                 "logoMatchedPattern": logo_result["matchedPattern"] if logo_result else None,
                 "logoAcquirer": logo_result["acquirerCompany"] if logo_result else None,

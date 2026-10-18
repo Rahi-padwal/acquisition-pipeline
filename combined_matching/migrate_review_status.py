@@ -20,7 +20,7 @@ import sys
 DEFAULT_DB_PATH = "combined_acquisitions_full.db"
 
 # Mirrors combined_check._REVIEW_FLOOR - keep in sync.
-_REVIEW_FLOOR = 0.3
+_REVIEW_FLOOR = 0.35
 
 
 def _ensure_review_status_column(conn: sqlite3.Connection) -> None:
@@ -53,7 +53,7 @@ def migrate(db_path: str) -> None:
             "WHERE isAcquired IS NOT NULL AND confidenceScore IS NULL"
         )
         conn.execute(
-            "UPDATE combined_acquisitions SET isAcquired = 0, reviewStatus = 'likely_acquired' "
+            "UPDATE combined_acquisitions SET isAcquired = 0, reviewStatus = 'needs_review' "
             "WHERE confidenceScore IS NOT NULL AND confidenceScore <= ?",
             (_REVIEW_FLOOR,),
         )

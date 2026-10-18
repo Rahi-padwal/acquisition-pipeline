@@ -12,14 +12,21 @@ from __future__ import annotations
 
 import sys
 
+from detection import extract_acquirer_from_logo_text
 from ocr import run_ocr
 
 if __name__ == "__main__":
-    if len(sys.argv) != 2:
-        print("Usage: python test_single_image.py <image_path>")
-        sys.exit(1)
+    img= "/home/ubuntu/acquired_company/logo_matching/sample.jpg"
+    company_name = sys.argv[1] if len(sys.argv) > 1 else None
 
-    result = run_ocr(sys.argv[1])
+    result = run_ocr(img)
     print(f"OCR text: {result.text!r}")
     for text, score in result.lines:
         print(f"  line={text!r} score={score:.2f}")
+
+    detection = extract_acquirer_from_logo_text(result.high_confidence_text(), company_name)
+    print(f"is_acquired: {detection is not None}")
+    if detection is not None:
+        print(f"  acquirerCompany={detection['acquirerCompany']!r}")
+        print(f"  matchedPattern={detection['matchedPattern']!r}")
+        print(f"  confidenceScore={detection['confidenceScore']}")

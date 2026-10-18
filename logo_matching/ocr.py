@@ -13,6 +13,18 @@ direct testing against the sample logos in `data/logo_samples/`), a known
 oneDNN/PIR-executor incompatibility in this paddlepaddle build, not an
 image-specific failure.
 
+cpu_threads=1 is likewise required, not optional, on this machine: with the
+default multi-threaded matmul, every predict() call segfaults inside
+OpenBLAS's sgemm_itcopy (confirmed via gdb backtrace into libphi_core.so) -
+a known OpenBLAS runtime-CPU-dispatch bug on AWS Graviton2/Neoverse-N1.
+Standard OPENBLAS_NUM_THREADS/OPENBLAS_CORETYPE env vars don't reach this
+build (OpenBLAS is statically linked into libphi_core without honoring
+them); only PaddleOCR's own cpu_threads config plumbs through and avoids
+the crash. This does mean OCR runs single-threaded per instance - fine here
+since each worker thread already gets its own PaddleOCR instance (see
+below), so parallelism comes from the thread pool, not from within a
+single predict() call.
+
 use_doc_orientation_classify/use_doc_unwarping are disabled: those stages
 exist for scanned-document photos (skewed page detection, dewarping) and
 are irrelevant to small flat logo graphics - leaving them on only adds
@@ -63,9 +75,35 @@ def _get_ocr() -> PaddleOCR:
         _thread_local.ocr = PaddleOCR(
             use_doc_orientation_classify=False,
             use_doc_unwarping=False,
-            use_textline_orientation=True,
+            # Disabled after a direct A/B benchmark against 99 real fetched
+            # logos (incl. the 7 with a known ground-truth acquirer): 19.1%
+            # faster (0.561s -> 0.454s/image) with ZERO detection-outcome
+            # changes across all 99 images and identical corroborated/
+            # conflict/no_signal counts on the known-acquirer set. Text
+            # differed on 5/99 images, but only in discarded low-confidence
+            # fragments (a stray character or two) that never fed into
+            # extract_acquirer_from_logo_text either way - profiling (py-spy,
+            # live production process) showed this stage running a full
+            # per-detected-text-region classification pass, on top of
+            # detection+recognition, for no measurable benefit on this
+            # project's logos.
+            use_textline_orientation=False,
             lang="en",
             enable_mkldnn=False,
+            cpu_threads=1,
+            # Swapped from the default PP-OCRv6_medium det/rec models for the
+            # ~800K-image batch run - PP-OCRv6_tiny was tried first (~7.2x
+            # faster, ~0.12s/image) but real-world accuracy on this project's
+            # logos wasn't acceptable, so this uses PP-OCRv5_mobile instead:
+            # benchmarked at ~0.27s/image on this machine vs ~0.89s/image for
+            # v6_medium (~3.3x faster - roughly a ~9-day to ~2.6-day single-
+            # process run), with confidence much closer to the v6_medium
+            # baseline (0.965 vs 0.970 on the one sample benchmarked, vs
+            # v6_tiny's 0.941). Detection logic itself (detection.py) is
+            # unchanged - this only changes which OCR weights produce the
+            # text detection.py scans.
+            text_detection_model_name="PP-OCRv5_mobile_det",
+            text_recognition_model_name="en_PP-OCRv5_mobile_rec",
         )
     return _thread_local.ocr
 

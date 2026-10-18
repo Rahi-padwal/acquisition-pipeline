@@ -31,6 +31,7 @@ which sub-case you're looking at, only that it's worth sampling.
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass
 from typing import Literal
 
@@ -41,6 +42,28 @@ import requests
 _TIMEOUT_SECONDS = 20
 
 FetchOutcome = Literal["ok", "no_logo", "access_denied", "fetch_failed"]
+
+# One requests.Session PER FETCH-WORKER THREAD (threading.local), not a
+# bare requests.get() call - every logo lives behind the same S3 host
+# (crustdata-media.s3.us-east-2.amazonaws.com), so a plain requests.get()
+# was paying a fresh TCP+TLS handshake on every single one of 800K
+# fetches instead of reusing a keep-alive connection. That handshake is
+# real CPU work (key exchange, cipher setup), and with 16 fetch threads
+# doing it concurrently on this box's 2 vCPUs, it was contending for CPU
+# with the single OCR thread that needs a full core to hit its
+# benchmarked 0.27s/image (confirmed against run_logo_ocr_batch.log:
+# OCR-inclusive throughput was ~0.52s/image, ~2x the pure predict()
+# benchmark). Thread-local rather than a shared module-level Session
+# since requests.Session isn't documented thread-safe for concurrent use
+# from multiple threads - same rationale as ocr.py's per-thread
+# PaddleOCR instance.
+_thread_local = threading.local()
+
+
+def _get_session() -> requests.Session:
+    if not hasattr(_thread_local, "session"):
+        _thread_local.session = requests.Session()
+    return _thread_local.session
 
 
 @dataclass
@@ -55,7 +78,7 @@ def fetch_logo_image(logo_url: str | None) -> FetchResult:
         return FetchResult(outcome="no_logo", detail="logoS3Path missing/null/empty in ES")
 
     try:
-        resp = requests.get(logo_url, timeout=_TIMEOUT_SECONDS)
+        resp = _get_session().get(logo_url, timeout=_TIMEOUT_SECONDS)
     except requests.Timeout:
         return FetchResult(outcome="fetch_failed", detail="timeout")
     except requests.RequestException as exc:

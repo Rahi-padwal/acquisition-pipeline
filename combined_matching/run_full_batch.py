@@ -11,6 +11,21 @@ scale (~768k companies x up to 6 S3 lookups each) stage 3 is the dominant
 cost of a full run - budget for it accordingly (see the conversation this
 was added from for a rough time estimate).
 
+Stage 4 (logo OCR) runs per-page too, right after stage 3's commit, reusing
+combined_matching/logo_detection.py's _fetch_worker()/_ocr_worker()/
+merge_logo_result_into_db() unmodified - same corroboration/conflict logic
+stage 3 already uses, just against the logo-graphic signal instead of the
+S3 scrape. Unlike stages 1-3 (a fresh ThreadPoolExecutor per page, fine
+for stateless CPU/IO work), stage 4's fetch+OCR worker pool is built ONCE
+before the page loop and kept alive for the whole run: run_logo_ocr_batch.py
+already diagnosed and fixed the alternative (a new pool, and therefore a
+new ~528MB PaddleOCR instance, every single page - OOM-killed that process
+after ~10 pages), so this reuses that exact same persistent-pool fix
+rather than reintroducing the bug. logoS3Path is fetched alongside the
+existing _SOURCE_FIELDS locally in fetch_page() (added, not edited into
+the shared fetch_snapshot.py constant, since other scripts import that
+constant too).
+
 Unlike test_combined_pipeline.py's random_score sampling, this paginates
 through the FULL matching set via search_after, sorted by dwhId.keyword
 (dwhId itself is mapped `text`, not sortable directly - ES rejects sorting
@@ -46,8 +61,10 @@ from __future__ import annotations
 import json
 import logging
 import os
+import queue
 import sqlite3
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -59,13 +76,13 @@ from elasticsearch import Elasticsearch
 load_dotenv()
 
 _ROOT = Path(__file__).resolve().parent.parent
-for _subdir in ("name_matching", "description_matching"):
+for _subdir in ("name_matching", "description_matching", "logo_matching"):
     _path = str(_ROOT / _subdir)
     if _path not in sys.path:
         sys.path.insert(0, _path)
 
 from check_name_signals import check_company_record  # noqa: E402 (from name_matching)
-from data_source import CompanyRecord, normalize_company_source  # noqa: E402 (from name_matching)
+from data_source import CompanyRecord, normalize_company_source, _normalize_text_field  # noqa: E402 (from name_matching)
 from description_detection_api import extract_acquirer_from_description  # noqa: E402 (from description_matching)
 
 from fetch_snapshot import _SOURCE_FIELDS  # noqa: E402
@@ -79,6 +96,14 @@ from s3_detection import (  # noqa: E402
     fetch_all_scrapes,
     list_pipeline_folders,
     merge_s3_result_into_db,
+)
+from logo_detection import (  # noqa: E402
+    FETCH_WORKERS as LOGO_FETCH_WORKERS,
+    OCR_WORKERS as LOGO_OCR_WORKERS,
+    _OCR_QUEUE_MAXSIZE as _LOGO_OCR_QUEUE_MAXSIZE,
+    _fetch_worker as _logo_fetch_worker,
+    _ocr_worker as _logo_ocr_worker,
+    merge_logo_result_into_db,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
@@ -156,7 +181,10 @@ def fetch_page(
         "size": PAGE_SIZE,
         "query": _EXISTS_QUERY,
         "sort": [{"dwhId.keyword": "asc"}],
-        "_source": _SOURCE_FIELDS,
+        # logoS3Path added locally for stage 4 (logo OCR) rather than
+        # editing the shared _SOURCE_FIELDS constant, which other scripts
+        # (e.g. fetch_snapshot.py) import too.
+        "_source": [*_SOURCE_FIELDS, "logoS3Path"],
     }
     if search_after is not None:
         body["search_after"] = search_after
@@ -176,6 +204,10 @@ def fetch_page(
             continue
         if not source.get("companyId"):
             source["companyId"] = hit.get("_id", "")
+        # Same list-shaped-field surprise run_logo_ocr_batch.py already hit
+        # for this exact field (a real dwhId's logoS3Path can come back as
+        # an ES array) - same fix, applied only to this new field.
+        source["logoS3Path"] = _normalize_text_field(source.get("logoS3Path"))
         sources.append(source)
 
     last_sort = hits[-1]["sort"] if hits else None
@@ -273,84 +305,149 @@ def run_batch(es: Elasticsearch, conn: sqlite3.Connection, s3, s3_folders: list[
     search_after = checkpoint["last_dwh_id"]
     processed = checkpoint["processed"]
     stage3_outcomes: dict[str, int] = {}
+    stage4_outcomes: dict[str, int] = {}
 
     if search_after is not None:
         logger.info("Resuming from checkpoint: %d companies already processed, last dwhId=%s", processed, search_after)
 
+    # Stage 4 (logo OCR) worker pool - built ONCE for the whole run, not per
+    # page, and fed every page's work through these same long-lived queues.
+    # See the module docstring's stage 4 paragraph for why this differs from
+    # stages 1-3's per-page ThreadPoolExecutor pattern.
+    logo_work_queue: "queue.Queue" = queue.Queue()
+    logo_ocr_queue: "queue.Queue" = queue.Queue(maxsize=_LOGO_OCR_QUEUE_MAXSIZE)
+    logo_results: list[dict[str, Any]] = []
+    logo_results_lock = threading.Lock()
+    logo_progress = [0]  # cosmetic - only used by _logo_ocr_worker's own "processed X/Y" print
+
+    logo_fetch_threads = [
+        threading.Thread(target=_logo_fetch_worker, args=(logo_work_queue, logo_ocr_queue), daemon=True)
+        for _ in range(LOGO_FETCH_WORKERS)
+    ]
+    logo_ocr_threads = [
+        threading.Thread(
+            target=_logo_ocr_worker,
+            args=(logo_ocr_queue, logo_results, logo_results_lock, logo_progress, 0),
+            daemon=True,
+        )
+        for _ in range(LOGO_OCR_WORKERS)
+    ]
+    for t in logo_fetch_threads + logo_ocr_threads:
+        t.start()
+
     start = time.time()
-    while True:
-        page, last_sort, raw_hit_count = fetch_page(es, search_after)
-        if raw_hit_count == 0:
-            # Zero raw hits (not just zero usable sources - a page can be
-            # non-empty but have every hit skipped for a missing dwhId, and
-            # that's not "done", just an unusually bad page).
-            break
+    try:
+        while True:
+            page, last_sort, raw_hit_count = fetch_page(es, search_after)
+            if raw_hit_count == 0:
+                # Zero raw hits (not just zero usable sources - a page can be
+                # non-empty but have every hit skipped for a missing dwhId, and
+                # that's not "done", just an unusually bad page).
+                break
 
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            futures = [executor.submit(process_company, source) for source in page]
-            results = [future.result() for future in as_completed(futures)]
+            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                futures = [executor.submit(process_company, source) for source in page]
+                results = [future.result() for future in as_completed(futures)]
 
-        for row in results:
-            dwh_id_value = _to_sqlite_value(row.get("dwhId"))
-            try:
-                conn.execute(
-                    "INSERT OR REPLACE INTO combined_acquisitions "
-                    "(dwhId, companyName, isAcquired, acquirerCompany, source, matchedPattern, confidenceScore, reviewStatus) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                    (
-                        dwh_id_value,
-                        _to_sqlite_value(row.get("companyName")),
-                        _to_sqlite_value(row.get("isAcquired")),
-                        _to_sqlite_value(row.get("acquirerCompany")),
-                        _to_sqlite_value(row.get("source")),
-                        _to_sqlite_value(row.get("matchedPattern")),
-                        _to_sqlite_value(row.get("confidenceScore")),
-                        _to_sqlite_value(row.get("reviewStatus")),
-                    ),
-                )
-            except Exception:
-                # Belt-and-suspenders: _to_sqlite_value() should already
-                # prevent this, but one bad row must never abort the rest
-                # of the page's writes or crash the batch - record it as an
-                # error row instead of losing it silently.
-                logger.exception("dwhId %s: failed to write to SQLite even after coercion", dwh_id_value)
-                conn.execute(
-                    "INSERT OR REPLACE INTO combined_acquisitions "
-                    "(dwhId, companyName, isAcquired, acquirerCompany, source, matchedPattern, confidenceScore, reviewStatus) "
-                    "VALUES (?, NULL, NULL, NULL, NULL, NULL, NULL, NULL)",
-                    (dwh_id_value,),
-                )
-        conn.commit()
+            for row in results:
+                dwh_id_value = _to_sqlite_value(row.get("dwhId"))
+                try:
+                    conn.execute(
+                        "INSERT OR REPLACE INTO combined_acquisitions "
+                        "(dwhId, companyName, isAcquired, acquirerCompany, source, matchedPattern, confidenceScore, reviewStatus) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            dwh_id_value,
+                            _to_sqlite_value(row.get("companyName")),
+                            _to_sqlite_value(row.get("isAcquired")),
+                            _to_sqlite_value(row.get("acquirerCompany")),
+                            _to_sqlite_value(row.get("source")),
+                            _to_sqlite_value(row.get("matchedPattern")),
+                            _to_sqlite_value(row.get("confidenceScore")),
+                            _to_sqlite_value(row.get("reviewStatus")),
+                        ),
+                    )
+                except Exception:
+                    # Belt-and-suspenders: _to_sqlite_value() should already
+                    # prevent this, but one bad row must never abort the rest
+                    # of the page's writes or crash the batch - record it as an
+                    # error row instead of losing it silently.
+                    logger.exception("dwhId %s: failed to write to SQLite even after coercion", dwh_id_value)
+                    conn.execute(
+                        "INSERT OR REPLACE INTO combined_acquisitions "
+                        "(dwhId, companyName, isAcquired, acquirerCompany, source, matchedPattern, confidenceScore, reviewStatus) "
+                        "VALUES (?, NULL, NULL, NULL, NULL, NULL, NULL, NULL)",
+                        (dwh_id_value,),
+                    )
+            conn.commit()
 
-        # Stage 3 (S3 web scrape) for this same page - runs AFTER the stage
-        # 1+2 commit above, so merge_s3_result_into_db() (which reads the
-        # existing row to decide corroboration/conflict) sees this page's
-        # fresh stage 1+2 verdict rather than a stale one from a prior run.
-        dwh_ids_this_page = [row["dwhId"] for row in results if row.get("dwhId")]
-        with ThreadPoolExecutor(max_workers=S3_MAX_WORKERS) as executor:
-            futures = [
-                executor.submit(_run_stage3_for_page, s3, s3_folders, dwh_id) for dwh_id in dwh_ids_this_page
-            ]
-            stage3_page_results = [future.result() for future in as_completed(futures)]
+            # Stage 3 (S3 web scrape) for this same page - runs AFTER the stage
+            # 1+2 commit above, so merge_s3_result_into_db() (which reads the
+            # existing row to decide corroboration/conflict) sees this page's
+            # fresh stage 1+2 verdict rather than a stale one from a prior run.
+            dwh_ids_this_page = [row["dwhId"] for row in results if row.get("dwhId")]
+            with ThreadPoolExecutor(max_workers=S3_MAX_WORKERS) as executor:
+                futures = [
+                    executor.submit(_run_stage3_for_page, s3, s3_folders, dwh_id) for dwh_id in dwh_ids_this_page
+                ]
+                stage3_page_results = [future.result() for future in as_completed(futures)]
 
-        for row in stage3_page_results:
-            if row["no_data"]:
-                stage3_outcomes["no_s3_data"] = stage3_outcomes.get("no_s3_data", 0) + 1
-                continue
-            outcome = merge_s3_result_into_db(conn, row["dwhId"], row["companyName"], row["s3_result"])
-            stage3_outcomes[outcome] = stage3_outcomes.get(outcome, 0) + 1
-        conn.commit()
+            for row in stage3_page_results:
+                if row["no_data"]:
+                    stage3_outcomes["no_s3_data"] = stage3_outcomes.get("no_s3_data", 0) + 1
+                    continue
+                outcome = merge_s3_result_into_db(conn, row["dwhId"], row["companyName"], row["s3_result"])
+                stage3_outcomes[outcome] = stage3_outcomes.get(outcome, 0) + 1
+            conn.commit()
 
-        processed += len(page)
-        search_after = last_sort
-        _save_checkpoint(search_after, processed)
+            # Stage 4 (logo OCR) for this same page - runs AFTER stage 3's
+            # commit above, same reasoning: merge_logo_result_into_db() reads
+            # the existing row, so it needs to see this page's fresh stage 1-3
+            # verdict, not a stale one. Fed through the persistent pool built
+            # in run_batch() above, not a per-page pool (see that comment).
+            start_len = len(logo_results)
+            for source in page:
+                logo_work_queue.put((source["dwhId"], source.get("companyName"), source.get("logoS3Path")))
 
-        if processed % PROGRESS_EVERY < PAGE_SIZE:
-            elapsed = time.time() - start
-            logger.info("Processed %d companies so far (%.1fs elapsed)", processed, elapsed)
+            target_len = start_len + len(page)
+            while True:
+                with logo_results_lock:
+                    current_len = len(logo_results)
+                if current_len >= target_len:
+                    break
+                time.sleep(0.5)
+            with logo_results_lock:
+                logo_page_results = logo_results[start_len:target_len]
 
-        if raw_hit_count < PAGE_SIZE:
-            break
+            for row in logo_page_results:
+                outcome = merge_logo_result_into_db(conn, row["dwhId"], row["companyName"], row["logo_result"])
+                stage4_outcomes[outcome] = stage4_outcomes.get(outcome, 0) + 1
+            conn.commit()
+
+            processed += len(page)
+            search_after = last_sort
+            _save_checkpoint(search_after, processed)
+
+            if processed % PROGRESS_EVERY < PAGE_SIZE:
+                elapsed = time.time() - start
+                logger.info("Processed %d companies so far (%.1fs elapsed)", processed, elapsed)
+
+            if raw_hit_count < PAGE_SIZE:
+                break
+    finally:
+        # Stage 4 pool shutdown - same sentinel + join sequence as
+        # run_logo_ocr_batch.py's own persistent pool. Runs whether the loop
+        # above completed normally or raised (Ctrl+C, a fetch_page error
+        # that exhausts retries, etc.) so the OCR/fetch threads are never
+        # left dangling.
+        for _ in range(LOGO_FETCH_WORKERS):
+            logo_work_queue.put(None)
+        for t in logo_fetch_threads:
+            t.join()
+        for _ in range(LOGO_OCR_WORKERS):
+            logo_ocr_queue.put(None)
+        for t in logo_ocr_threads:
+            t.join()
 
     elapsed = time.time() - start
     logger.info("Done. Processed %d companies total in %.1fs.", processed, elapsed)
@@ -365,6 +462,7 @@ def run_batch(es: Elasticsearch, conn: sqlite3.Connection, s3, s3_folders: list[
         "acquired=%d likely_acquired=%d not_acquired=%d errors=%d", acquired, likely_acquired, not_acquired, errors
     )
     logger.info("stage 3 (S3): %s", stage3_outcomes)
+    logger.info("stage 4 (logo OCR): %s", stage4_outcomes)
 
 
 def main() -> None:
