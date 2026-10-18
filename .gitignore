@@ -5,3 +5,8 @@ __pycache__/
 web_scraping/
 .venv/
 .claude/
+*.xlsx
+*.log
+*_output*.csv
+timing_test_*
+out*.txt

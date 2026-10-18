@@ -41,7 +41,7 @@ Usage:
     no-op for these rows - see detection.py)
   - "dwhId"             - looked up in Elasticsearch for companyName + URL
 Defaults to test_data.csv (dwhId,logoS3Path pairs) if present next to this
-script, else ../dwhids_1987.txt (plain dwhId list, one per row, no header -
+script, else ../data/dwhids_1987.txt (plain dwhId list, one per row, no header -
 same convention as combined_matching/run_pipeline_on_file.py).
 """
 
@@ -67,7 +67,7 @@ if hasattr(sys.stdout, "reconfigure"):
 
 _MODULE_DIR = Path(__file__).resolve().parent
 _DEFAULT_INPUT = (
-    _MODULE_DIR / "test_data.csv" if (_MODULE_DIR / "test_data.csv").is_file() else _MODULE_DIR.parent / "dwhids_1987.txt"
+    _MODULE_DIR / "test_data.csv" if (_MODULE_DIR / "test_data.csv").is_file() else _MODULE_DIR.parent / "data" / "dwhids_1987.txt"
 )
 
 

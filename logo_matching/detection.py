@@ -6,7 +6,7 @@ project follows for sibling detectors: each source has different text
 shape and shouldn't require touching the others to change.
 
 Pattern set chosen (5 patterns) after inspecting real OCR output from the
-sample logos in `logo data/`:
+sample logos in `data/logo_samples/`:
 
     powered_by      - "powered by X"
     a_x_company     - "a X company" / "an X company"

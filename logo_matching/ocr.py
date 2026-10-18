@@ -9,7 +9,7 @@ enable_mkldnn=False is required, not optional, on this machine's CPU/paddle
 build - with mkldnn on, text detection raises
 "NotImplementedError: ... ConvertPirAttribute2RuntimeAttribute not support
 [pir::ArrayAttribute<pir::DoubleAttribute>]" on every image (confirmed via
-direct testing against the sample logos in `logo data/`), a known
+direct testing against the sample logos in `data/logo_samples/`), a known
 oneDNN/PIR-executor incompatibility in this paddlepaddle build, not an
 image-specific failure.
 
